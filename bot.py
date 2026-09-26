@@ -141,5 +141,9 @@ async def clear_punish(ctx, member: discord.Member):
         await log_channel.send(f"🔓 **제재 해제**: 관리자가 {member.mention}님의 타임아웃 및 전과 역할을 삭제하고 제재를 풀었습니다.")
 
 # ================= [ 봇 실행 ] =================
-keep_alive()
+@bot.event
+async def setup_hook():
+    """봇이 구동되기 직전에 웹서버를 안전하게 동시 실행합니다."""
+    keep_alive()
+
 bot.run(os.getenv("DISCORD_TOKEN"))
