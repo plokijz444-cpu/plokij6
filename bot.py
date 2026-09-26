@@ -4,6 +4,7 @@ import datetime
 from flask import Flask
 from threading import Thread
 import os
+import asyncio
 
 # ================= [ Render 24시간 가동을 위한 웹서버 ] =================
 app = Flask('')
@@ -13,12 +14,12 @@ def home():
     return "Bot is running!"
 
 def run():
-    # Render 환경에서 안정적으로 포트를 열기 위해 8080 고정
+    # 렌더의 포트 감지 시스템을 통과하기 위해 포트 강제 고정
     app.run(host='0.0.0.0', port=8080)
 
 def keep_alive():
-    """웹서버를 디스코드 봇과 완전히 분리된 별도의 스레드에서 실행합니다."""
-    t = Thread(target=run, daemon=True) # daemon=True로 설정하여 메인 프로세스 종료 시 함께 종료되도록 안전 장치
+    """메인 프로세스와 충돌 나지 않도록 데몬 스레드로 안전하게 분리 구동합니다."""
+    t = Thread(target=run, daemon=True)
     t.start()
 
 # ================= [ 디스코드 봇 설정 & 데이터 ] =================
@@ -35,16 +36,19 @@ BANNED_WORDS = ["장애","애미","느금","너엄","너애미","너애비","느
 # 전과 기록 저장소 { 유저ID : 전과_횟수 }
 criminal_records = {}
 
+# 개발자 포털의 3가지 스위치와 일치하도록 인텐트 설정
 intents = discord.Intents.default()
 intents.message_content = True  # 메시지 내용 읽기 권한
 intents.members = True          # 서버 멤버 관리 권한
+intents.presences = True        # 상태 정보 권한
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # ================= [ 공통 제재 및 전과 추가 로직 ] =================
 async def punish_user(guild: discord.Guild, member: discord.Member, reason: str):
-    if not guild:
+    if not guild or not member:
         return
+        
     guild_id = guild.id
     if guild_id not in SERVER_CONFIG:
         return
@@ -64,7 +68,9 @@ async def punish_user(guild: discord.Guild, member: discord.Member, reason: str)
                 await log_channel.send(f"🚨 **{member.mention}**님이 전과 20범이 되어 서버에서 **영구 차단(BAN)** 되었습니다. (사유: {reason})")
         except discord.Forbidden:
             if log_channel:
-                await log_channel.send(f"❌ 봇의 역할 권한이 부족하여 {member.mention}님을 차단하지 못했습니다. (봇의 역할을 최고 높음으로 올려주세요)")
+                await log_channel.send(f"❌ 봇의 권한/서열이 부족하여 {member.mention}님을 차단하지 못했습니다. 디스코드 설정에서 봇 역할을 위로 올려주세요.")
+        except Exception as e:
+            print(f"Ban Error: {e}")
         return
 
     # 전과 역할 이름 생성
@@ -83,14 +89,14 @@ async def punish_user(guild: discord.Guild, member: discord.Member, reason: str)
     if not role:
         try:
             role = await guild.create_role(name=role_name, reason="전과 시스템 자동 생성")
-        except:
-            pass
+        except Exception as e:
+            print(f"Role Create Error: {e}")
     
     if role:
         try:
             await member.add_roles(role)
-        except:
-            pass
+        except Exception as e:
+            print(f"Role Add Error: {e}")
 
     # 타임아웃 시간 계산 (전과 수 만큼 '일' 단위 추가)
     duration = datetime.timedelta(days=current_count)
@@ -98,16 +104,22 @@ async def punish_user(guild: discord.Guild, member: discord.Member, reason: str)
         await member.timed_out_until(discord.utils.utcnow() + duration, reason=f"{role_name} 제재 ({reason})")
     except discord.Forbidden:
         if log_channel:
-            await log_channel.send(f"❌ 봇의 역할 권한이 부족하여 {member.mention}님을 타임아웃 처리하지 못했습니다.")
+            await log_channel.send(f"❌ 봇의 권한/서열이 부족하여 {member.mention}님을 타임아웃 처리하지 못했습니다.")
+        return
+    except Exception as e:
+        print(f"Timeout Error: {e}")
         return
 
     if log_channel:
-        await log_channel.send(
-            f"⚠️ **제재 알림**\n"
-            f"👤 **대상자**: {member.mention}\n"
-            f"📜 **조치**: {role_name} 부여 및 {current_count}일간 타임아웃\n"
-            f"💬 **사유**: {reason}"
-        )
+        try:
+            await log_channel.send(
+                f"⚠️ **제재 알림**\n"
+                f"👤 **대상자**: {member.mention}\n"
+                f"📜 **조치**: {role_name} 부여 및 {current_count}일간 타임아웃\n"
+                f"💬 **사유**: {reason}"
+            )
+        except:
+            pass
 
 # ================= [ 이벤트 및 명령어 ] =================
 @bot.event
@@ -120,7 +132,10 @@ async def on_message(message: discord.Message):
         return
 
     if message.content == "안녕":
-        await message.channel.send(f"안녕하세요, {message.author.mention}님! 반가워요.")
+        try:
+            await message.channel.send(f"안녕하세요, {message.author.mention}님! 반가워요.")
+        except:
+            pass
         return
 
     for word in BANNED_WORDS:
@@ -138,7 +153,10 @@ async def on_message(message: discord.Message):
 @commands.has_permissions(moderate_members=True)
 async def manual_punish(ctx, member: discord.Member):
     await punish_user(ctx.guild, member, "관리자 수동 제재")
-    await ctx.send(f"👌 {member.mention} 유저를 제재했습니다.", delete_after=5)
+    try:
+        await ctx.send(f"👌 {member.mention} 유저를 제재했습니다.", delete_after=5)
+    except:
+        pass
 
 @bot.command(name="제재지우기")
 @commands.has_permissions(moderate_members=True)
@@ -165,11 +183,22 @@ async def clear_punish(ctx, member: discord.Member):
     if member.id in criminal_records:
         del criminal_records[member.id]
 
-    await ctx.send(f"✅ {member.mention}님의 제재가 해제되었습니다.", delete_after=5)
+    try:
+        await ctx.send(f"✅ {member.mention}님의 제재가 해제되었습니다.", delete_after=5)
+    except:
+        pass
+        
     if log_channel:
-        await log_channel.send(f"🔓 **제재 해제**: 관리자가 {member.mention}님의 타임아웃 및 전과 역할을 삭제하고 제재를 풀었습니다.")
+        try:
+            await log_channel.send(f"🔓 **제재 해제**: 관리자가 {member.mention}님의 타임아웃 및 전과 역할을 삭제하고 제재를 풀었습니다.")
+        except:
+            pass
 
 # ================= [ 봇 실행 ] =================
-# 백그라운드 웹서버를 먼저 가동하고, 메인 스레드에서 blocking 방식으로 봇을 구동하여 안정성을 확보합니다.
+# 웹서버 개설 후 메인 루프 가동
 keep_alive()
-bot.run(os.getenv("DISCORD_TOKEN"))
+token = os.getenv("DISCORD_TOKEN")
+if token:
+    bot.run(token)
+else:
+    print("Error: DISCORD_TOKEN environment variable is not set.")
