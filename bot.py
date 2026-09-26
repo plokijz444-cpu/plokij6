@@ -13,10 +13,12 @@ def home():
     return "Bot is running!"
 
 def run():
+    # Render 환경에서 안정적으로 포트를 열기 위해 8080 고정
     app.run(host='0.0.0.0', port=8080)
 
 def keep_alive():
-    t = Thread(target=run)
+    """웹서버를 디스코드 봇과 완전히 분리된 별도의 스레드에서 실행합니다."""
+    t = Thread(target=run, daemon=True) # daemon=True로 설정하여 메인 프로세스 종료 시 함께 종료되도록 안전 장치
     t.start()
 
 # ================= [ 디스코드 봇 설정 & 데이터 ] =================
@@ -27,7 +29,7 @@ SERVER_CONFIG = {
     1543921157101854820: 1553219199084798054   # 서버 3 ID : 제재방 3 ID
 }
 
-# 자동 검열 금지어 목록 (원하는 단어로 바꾸세요)
+# 자동 검열 금지어 목록
 BANNED_WORDS = ["장애","애미","느금","너엄","너애미","너애비","느금마","느금빠","느개비","느그애비","애비","창녀","창년","보지","봊이","자지","섹스","섹x","정액"]
 
 # 전과 기록 저장소 { 유저ID : 전과_횟수 }
@@ -41,6 +43,8 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 # ================= [ 공통 제재 및 전과 추가 로직 ] =================
 async def punish_user(guild: discord.Guild, member: discord.Member, reason: str):
+    if not guild:
+        return
     guild_id = guild.id
     if guild_id not in SERVER_CONFIG:
         return
@@ -54,9 +58,13 @@ async def punish_user(guild: discord.Guild, member: discord.Member, reason: str)
 
     # 20범 도달 시 -> 밴(추방)
     if current_count >= 20:
-        await member.ban(reason=f"전과 20범 달성 ({reason})")
-        if log_channel:
-            await log_channel.send(f"🚨 **{member.mention}**님이 전과 20범이 되어 서버에서 **영구 차단(BAN)** 되었습니다. (사유: {reason})")
+        try:
+            await member.ban(reason=f"전과 20범 달성 ({reason})")
+            if log_channel:
+                await log_channel.send(f"🚨 **{member.mention}**님이 전과 20범이 되어 서버에서 **영구 차단(BAN)** 되었습니다. (사유: {reason})")
+        except discord.Forbidden:
+            if log_channel:
+                await log_channel.send(f"❌ 봇의 역할 권한이 부족하여 {member.mention}님을 차단하지 못했습니다. (봇의 역할을 최고 높음으로 올려주세요)")
         return
 
     # 전과 역할 이름 생성
@@ -65,18 +73,33 @@ async def punish_user(guild: discord.Guild, member: discord.Member, reason: str)
     # 기존 '전과 X범' 역할 제거
     for r in member.roles:
         if r.name.startswith("전과 ") and r.name.endswith("범"):
-            await member.remove_roles(r)
+            try:
+                await member.remove_roles(r)
+            except:
+                pass
 
     # 역할 찾기 또는 서버에 새로 생성하기
     role = discord.utils.get(guild.roles, name=role_name)
     if not role:
-        role = await guild.create_role(name=role_name, reason="전과 시스템 자동 생성")
+        try:
+            role = await guild.create_role(name=role_name, reason="전과 시스템 자동 생성")
+        except:
+            pass
     
-    await member.add_roles(role)
+    if role:
+        try:
+            await member.add_roles(role)
+        except:
+            pass
 
     # 타임아웃 시간 계산 (전과 수 만큼 '일' 단위 추가)
     duration = datetime.timedelta(days=current_count)
-    await member.timed_out_until(discord.utils.utcnow() + duration, reason=f"{role_name} 제재 ({reason})")
+    try:
+        await member.timed_out_until(discord.utils.utcnow() + duration, reason=f"{role_name} 제재 ({reason})")
+    except discord.Forbidden:
+        if log_channel:
+            await log_channel.send(f"❌ 봇의 역할 권한이 부족하여 {member.mention}님을 타임아웃 처리하지 못했습니다.")
+        return
 
     if log_channel:
         await log_channel.send(
@@ -127,11 +150,17 @@ async def clear_punish(ctx, member: discord.Member):
     log_channel_id = SERVER_CONFIG[guild_id]
     log_channel = ctx.guild.get_channel(log_channel_id)
 
-    await member.timed_out_until(None, reason="관리자가 제재 해제")
+    try:
+        await member.timed_out_until(None, reason="관리자가 제재 해제")
+    except:
+        pass
 
     for r in member.roles:
         if r.name.startswith("전과 ") and r.name.endswith("범"):
-            await member.remove_roles(r)
+            try:
+                await member.remove_roles(r)
+            except:
+                pass
 
     if member.id in criminal_records:
         del criminal_records[member.id]
@@ -141,9 +170,6 @@ async def clear_punish(ctx, member: discord.Member):
         await log_channel.send(f"🔓 **제재 해제**: 관리자가 {member.mention}님의 타임아웃 및 전과 역할을 삭제하고 제재를 풀었습니다.")
 
 # ================= [ 봇 실행 ] =================
-@bot.event
-async def setup_hook():
-    """봇이 구동되기 직전에 웹서버를 안전하게 동시 실행합니다."""
-    keep_alive()
-
+# 백그라운드 웹서버를 먼저 가동하고, 메인 스레드에서 blocking 방식으로 봇을 구동하여 안정성을 확보합니다.
+keep_alive()
 bot.run(os.getenv("DISCORD_TOKEN"))
