@@ -56,49 +56,53 @@ async def punish_user(guild: discord.Guild, member: discord.Member, reason: str,
             except ValueError:
                 continue
 
-    # 전과 데이터가 0이거나 초기화되었다면 -> 1범부터 순차 시작
+    # 전과 1범씩 정상 누적 (0이면 1부터 시작)
     current_count += 1
 
     try:
-        # 20범 도달 시 -> 영구 차단(BAN)
+        # 20범 도달 시 -> 영구 차단(BAN) 임베드 박스 전송
         if current_count >= 20:
             await member.ban(reason=f"전과 20범 달성 ({reason})")
             if log_channel:
-                await log_channel.send(f"🚨 **{member.mention}**님이 전과 20범이 되어 서버에서 **영구 차단(BAN)** 되었습니다.\n사유: {reason}\n집행자: {punisher}")
+                embed = discord.Embed(title="🚨 유저 영구 차단 (BAN)", color=discord.Color.red(), timestamp=discord.utils.utcnow())
+                embed.add_field(name="👤 대상자", value=f"{member.mention} ({member.name})", inline=True)
+                embed.add_field(name="🔨 집행자", value=punisher, inline=True)
+                embed.add_field(name="💬 최종 사유", value=reason, inline=False)
+                await log_channel.send(embed=embed)
             return
 
         role_name = f"전과 {current_count}범"
         
-        # 역할이 서버에 없으면 새로 생성
+        # 역할 자동 생성 및 기존 전과 역할 교체
         role = discord.utils.get(guild.roles, name=role_name)
         if not role:
             role = await guild.create_role(name=role_name, reason="전과 시스템 자동 생성")
 
-        # 역할 제거와 추가를 안전하게 교체
         if roles_to_remove:
             await member.remove_roles(*roles_to_remove)
         await member.add_roles(role)
 
-        # ⚠️ [타임아웃 적용법 교정] .edit(timed_out_until=...) 형식을 사용합니다.
+        # 타임아웃 적용 (최대 28일 제한 보호 적용)
         punish_days = min(current_count, 28)
         duration = datetime.timedelta(days=punish_days)
         target_time = discord.utils.utcnow() + duration
         
         await member.edit(timed_out_until=target_time, reason=f"{role_name} 제재 ({reason})")
 
-        # 제재방 로그 전송
+        # 2. ⭐ 네모 박스(Embed) 제재 로그 전송
         if log_channel:
-            await log_channel.send(
-                f"⚠️ **제재 알림**\n"
-                f"👤 **대상자**: {member.mention}\n"
-                f"🔨 **집행자**: {punisher}\n"
-                f"📜 **조치**: {role_name} 부여 및 {punish_days}일간 타임아웃\n"
-                f"💬 **사유**: {reason}"
-            )
+            embed = discord.Embed(title="⚠️ 유저 제재 알림", color=discord.Color.orange(), timestamp=discord.utils.utcnow())
+            embed.add_field(name="👤 대상자", value=f"{member.mention} ({member.name})", inline=True)
+            embed.add_field(name="🔨 집행자", value=punisher, inline=True)
+            embed.add_field(name="📜 조치 내용", value=f"**{role_name}** 부여 및 **{punish_days}일간** 타임아웃", inline=False)
+            embed.add_field(name="💬 제재 사유", value=reason, inline=False)
+            await log_channel.send(embed=embed)
             
     except discord.Forbidden:
         if log_channel:
-            await log_channel.send(f"❌ **제재 실패:** 봇의 역할(Role) 순위가 {member.mention}님이나 '{role_name}' 역할보다 낮습니다. 서버 설정에서 봇의 역할 순위를 맨 위로 올려주세요.")
+            embed = discord.Embed(title="❌ 제재 권한 실패 경고", color=discord.Color.dark_red())
+            embed.description = f"봇의 역할 순위가 {member.mention}님보다 낮아 제재 처리에 실패했습니다. 서버 설정에서 봇 역할을 위로 올려주세요."
+            await log_channel.send(embed=embed)
     except Exception as e:
         if log_channel:
             await log_channel.send(f"❌ **제재 실행 중 시스템 에러 발생:** `{e}`")
@@ -106,14 +110,14 @@ async def punish_user(guild: discord.Guild, member: discord.Member, reason: str,
 # ================= [ 이벤트 및 명령어 처리 ] =================
 @bot.event
 async def on_ready():
-    print(f"🤖 {bot.user.name} 봇이 에러 없이 가동되었습니다.")
+    print(f"🤖 {bot.user.name} 봇이 모든 시스템 수정을 마치고 가동되었습니다.")
 
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot or not message.guild:
         return
 
-    # 관리자 명령어가 들어오면 자동 검열을 우회하여 정상 작동 보장
+    # 관리자 명령어 우회 처리
     if message.content.startswith("!"):
         await bot.process_commands(message)
         return
@@ -126,9 +130,16 @@ async def on_message(message: discord.Message):
     # 일반 채팅 자동 금지어 검열 시스템
     for word in BANNED_WORDS:
         if word in message.content:
+            # ⭐ 유저가 친 문장 전체를 백업합니다.
+            original_sentence = message.content
+            
             try: await message.delete() 
             except discord.Forbidden: pass
-            await punish_user(message.guild, message.author, f"금지어 사용 검열 ({word})", "시스템 자동 검열")
+            
+            # ⭐ [핵심 수정] 보고 싶지 않은 사람들을 위해 문장 전체를 ||문장|| 기호로 감싸 클릭형 블라인더(스포일러)로 가립니다.
+            detailed_reason = f"금지어 `[{word}]` 사용 검열\n**[적발된 문장 원본]**\n|| {original_sentence} ||"
+            
+            await punish_user(message.guild, message.author, detailed_reason, "시스템 자동 검열")
             return
 
 # !제재 @사용자 명령어
@@ -158,20 +169,25 @@ async def clear_punish(ctx, member: discord.Member):
         except Exception: log_channel = None
 
     try:
-        # ⚠️ [수정 완료] 기존의 불가능했던 함수 호출 방식 대신 member.edit를 이용해 타임아웃을 안전하게 해제(None)합니다.
+        # 타임아웃 강제 해제
         await member.edit(timed_out_until=None, reason="관리자가 제재 해제")
 
-        # 전과 역할 일괄 제거
+        # 전과 역할 일괄 청소
         roles_to_remove = [r for r in member.roles if r.name.startswith("전과 ") and r.name.endswith("범")]
         if roles_to_remove:
             await member.remove_roles(*roles_to_remove)
 
+        # 네모 상자(Embed) 제재 해제 로그 전송
         if log_channel:
-            await log_channel.send(f"🔓 **제재 해제**: {ctx.author.mention} 관리자가 {member.mention}님의 타임아웃 및 전과 단계를 초기화했습니다.")
+            embed = discord.Embed(title="🔓 유저 제재 해제 완료", color=discord.Color.green(), timestamp=discord.utils.utcnow())
+            embed.add_field(name="👤 대상자", value=f"{member.mention} ({member.name})", inline=True)
+            embed.add_field(name="🔨 실행 관리자", value=ctx.author.mention, inline=True)
+            embed.description = "대상자의 타임아웃을 해제하고 서버 내 누적된 모든 전과 등급 역할을 철거했습니다."
+            await log_channel.send(embed=embed)
             
     except discord.Forbidden:
         if log_channel:
-            await log_channel.send(f"❌ **해제 실패:** 봇의 역할(Role) 순위가 {member.mention}님보다 낮아 제재를 해제할 수 없습니다.")
+            await log_channel.send(f"❌ **해제 실패:** 봇의 역할 순위가 낮아 {member.mention}님의 제재를 풀지 못했습니다.")
     except Exception as e:
         if log_channel:
             await log_channel.send(f"❌ **제재 해제 중 시스템 에러 발생:** `{e}`")
