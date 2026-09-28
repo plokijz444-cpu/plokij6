@@ -139,7 +139,7 @@ async def on_message(message: discord.Message):
     if message.author.bot or not message.guild:
         return
 
-    # [수정] 명령어 입력 시 즉시 처리 후 이벤트 종료 (충돌 방지 보완)
+    # 명령어 입력 시 즉시 처리 후 이벤트 종료 (충돌 방지 보완)
     if message.content.startswith("!"):
         await bot.process_commands(message)
         return
@@ -157,9 +157,7 @@ async def on_message(message: discord.Message):
             try: await message.delete() 
             except discord.Forbidden: pass
             
-            detailed_reason = f"금지어 `[{word}]` 사용 검열
-**[적발된 문장 원본]**
-|| {original_sentence} ||"
+            detailed_reason = f"금지어 `[{word}]` 사용 검열\n**[적발된 문장 원본]**\n|| {original_sentence} ||"
             
             await punish_user(message.guild, message.author, detailed_reason, "시스템 자동 검열")
             return
