@@ -26,42 +26,7 @@ SERVER_CONFIG = {
     1543921157101854820: 1553219199084798054   # 서버 3 ID : 제재방 3 ID
 }
 
-BANNED_WORDS = ["장애","애미","느금","너엄","너애미","너애비","느금마","느금빠","느개비","느그애비","애비","창녀","창년","보지","봊이","자지","섹스","섹x","정액"]
-
-intents = discord.Intents.default()
-intents.message_content = True  # 메시지 내용 읽기 권한
-intents.members = True          # 서버 멤버 관리 권한
-
-bot = commands.Bot(command_prefix="!", intents=intents)
-import discord
-from discord.ext import commands
-import datetime
-from flask import Flask
-from threading import Thread
-import os
-
-# ================= [ Render 24시간 가동을 위한 웹서버 ] =================
-app = Flask('')
-
-@app.route('/')
-def home():
-    return "Bot is running!"
-
-def run():
-    app.run(host='0.0.0.0', port=8080)
-
-def keep_alive():
-    t = Thread(target=run)
-    t.start()
-
-# ================= [ 디스코드 봇 설정 & 데이터 ] =================
-SERVER_CONFIG = {
-    1553762662868058164: 1554055050819670036,  # 서버 1 ID : 제재방 1 ID
-    1529347274403086468: 1546457831631224843,  # 서버 2 ID : 제재방 2 ID
-    1543921157101854820: 1553219199084798054   # 서버 3 ID : 제재방 3 ID
-}
-
-# ⭐ [추가] 서버 1 전용 인증방 ID 설정
+# ⭐ 서버 1 전용 인증방 ID 설정
 SERVER1_ID = 1553762662868058164
 SERVER1_AUTH_CHANNEL_ID = 1554061009302585384
 
@@ -153,10 +118,9 @@ async def punish_user(guild: discord.Guild, member: discord.Member, reason: str,
 async def on_ready():
     print(f"🤖 {bot.user.name} 봇이 모든 시스템 수정을 마치고 가동되었습니다.")
 
-# ⭐ [핵심 추가] 서버 1 입장을 감지하여 인증 채널에 맞춤 멘션 메시지를 전송하는 이벤트
+# 서버 1 입장을 감지하여 인증 채널에 맞춤 멘션 메시지를 전송하는 이벤트
 @bot.event
 async def on_member_join(member: discord.Member):
-    # 신규 입장한 서버의 ID가 서버 1 ID인지 확인
     if member.guild.id == SERVER1_ID:
         auth_channel = member.guild.get_channel(SERVER1_AUTH_CHANNEL_ID)
         if not auth_channel:
@@ -164,8 +128,6 @@ async def on_member_join(member: discord.Member):
             except Exception: auth_channel = None
 
         if auth_channel:
-            # 해당 서버의 관리자 권한을 가진 그룹을 태그하거나 단어로 언급할 수 있도록 구성
-            # 요청하신 멘션 양식을 완벽히 준수하여 일반 텍스트 전송
             welcome_msg = (
                 f"안녕하세요 {member.mention}님! 인증방에 닉/성별/참가경로/@관리자 멘션을 하시면 서버에 참가하실수 있어요. "
                 f"단, 인증양식이 다르다면 관리자가 서버에 참가를 시키지 않을수 있으니 조심하세요!"
@@ -177,7 +139,7 @@ async def on_message(message: discord.Message):
     if message.author.bot or not message.guild:
         return
 
-    # 관리자 명령어 우회 처리
+    # 관리자 명령어 우회 처리 (!로 시작하면 검열 건너뛰고 명령어로 처리)
     if message.content.startswith("!"):
         await bot.process_commands(message)
         return
@@ -207,7 +169,6 @@ async def manual_punish(ctx, member: discord.Member, *, reason: str = "관리자
     try: await ctx.message.delete()
     except discord.Forbidden: pass
 
-    # 명령어를 실행하는 유저의 최상위 역할 순위가 봇의 최상위 역할 순위보다 낮거나 같으면 실행 차단
     if ctx.author.top_role.position <= ctx.guild.me.top_role.position:
         return
 
@@ -220,7 +181,6 @@ async def clear_punish(ctx, member: discord.Member):
     try: await ctx.message.delete()
     except discord.Forbidden: pass
 
-    # 명령어를 실행하는 유저의 최상위 역할 순위가 봇의 최상위 역할 순위보다 낮거나 같으면 실행 차단
     if ctx.author.top_role.position <= ctx.guild.me.top_role.position:
         return
 
@@ -235,10 +195,8 @@ async def clear_punish(ctx, member: discord.Member):
         except Exception: log_channel = None
 
     try:
-        # 타임아웃 강제 해제
         await member.edit(timed_out_until=None, reason="관리자가 제재 감면 및 해제")
 
-        # 유저의 현재 전과 단계를 파악하고 기존 전과 역할을 수집합니다.
         current_count = 0
         roles_to_remove = []
         for r in member.roles:
@@ -252,7 +210,6 @@ async def clear_punish(ctx, member: discord.Member):
         if roles_to_remove:
             await member.remove_roles(*roles_to_remove)
 
-        # 전과 한 단계 차감
         next_count = max(0, current_count - 1)
 
         action_description = ""
@@ -280,6 +237,26 @@ async def clear_punish(ctx, member: discord.Member):
         if log_channel:
             await log_channel.send(f"❌ **제재 해제 중 시스템 에러 발생:** `{e}`")
 
-# ================= [ 봇 실행 ] =================
-keep_alive() 
-bot.run(os.getenv("DISCORD_TOKEN"))
+# ⭐ [추가된 명령어] !인증완료 @유저 멘션 남자/여자
+@bot.command(name="인증완료")
+@commands.has_permissions(manage_roles=True)  # 역할 관리 권한이 있는 관리자만 사용 가능
+async def verify(ctx, member: discord.Member, gender: str):
+    # 1. 서버 1의 지정된 인증 채널(SERVER1_AUTH_CHANNEL_ID)이 맞는지 검증
+    if ctx.channel.id != SERVER1_AUTH_CHANNEL_ID:
+        return
+
+    # 2. 고정 지급할 역할 객체 가져오기
+    role_jiwon = discord.utils.get(ctx.guild.roles, name="지원핑")
+    role_end = discord.utils.get(ctx.guild.roles, name="end")
+    
+    # 3. 입력된 성별 텍스트에 따른 유연한 역할 매칭
+    if gender == "남자":
+        role_gender = discord.utils.get(ctx.guild.roles, name="남자")
+    elif gender == "여자":
+        role_gender = discord.utils.get(ctx.guild.roles, name="여자")
+    else:
+        await ctx.send("⚠️ 성별은 '남자' 또는 '여자'로 정확히 입력해 주세요.")
+        return
+
+    # 4. 서버 내 역할 이름 존재 여부 최종 검증
+    if not (role_jiwon and role_end and role_gender):
