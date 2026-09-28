@@ -33,6 +33,45 @@ intents.message_content = True  # 메시지 내용 읽기 권한
 intents.members = True          # 서버 멤버 관리 권한
 
 bot = commands.Bot(command_prefix="!", intents=intents)
+import discord
+from discord.ext import commands
+import datetime
+from flask import Flask
+from threading import Thread
+import os
+
+# ================= [ Render 24시간 가동을 위한 웹서버 ] =================
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "Bot is running!"
+
+def run():
+    app.run(host='0.0.0.0', port=8080)
+
+def keep_alive():
+    t = Thread(target=run)
+    t.start()
+
+# ================= [ 디스코드 봇 설정 & 데이터 ] =================
+SERVER_CONFIG = {
+    1553762662868058164: 1554055050819670036,  # 서버 1 ID : 제재방 1 ID
+    1529347274403086468: 1546457831631224843,  # 서버 2 ID : 제재방 2 ID
+    1543921157101854820: 1553219199084798054   # 서버 3 ID : 제재방 3 ID
+}
+
+# ⭐ [추가] 서버 1 전용 인증방 ID 설정
+SERVER1_ID = 1553762662868058164
+SERVER1_AUTH_CHANNEL_ID = 1554061009302585384
+
+BANNED_WORDS = ["장애","애미","느금","너엄","너애미","너애비","느금마","느금빠","느개비","느그애비","애비","창녀","창년","보지","봊이","자지","섹스","섹x","정액"]
+
+intents = discord.Intents.default()
+intents.message_content = True  # 메시지 내용 읽기 권한
+intents.members = True          # 서버 멤버 관리 권한 (입장 감지에 필수)
+
+bot = commands.Bot(command_prefix="!", intents=intents)
 
 # ================= [ 공통 제재 및 전과 추가 로직 ] =================
 async def punish_user(guild: discord.Guild, member: discord.Member, reason: str, punisher: str = "시스템 자동 검열"):
@@ -77,7 +116,7 @@ async def punish_user(guild: discord.Guild, member: discord.Member, reason: str,
         # 역할 자동 생성 및 기존 전과 역할 교체
         role = discord.utils.get(guild.roles, name=role_name)
         if not role:
-            role = await guild.create_role(name=name, reason="전과 시스템 자동 생성")
+            role = await guild.create_role(name=role_name, reason="전과 시스템 자동 생성")
 
         if roles_to_remove:
             await member.remove_roles(*roles_to_remove)
@@ -114,6 +153,25 @@ async def punish_user(guild: discord.Guild, member: discord.Member, reason: str,
 async def on_ready():
     print(f"🤖 {bot.user.name} 봇이 모든 시스템 수정을 마치고 가동되었습니다.")
 
+# ⭐ [핵심 추가] 서버 1 입장을 감지하여 인증 채널에 맞춤 멘션 메시지를 전송하는 이벤트
+@bot.event
+async def on_member_join(member: discord.Member):
+    # 신규 입장한 서버의 ID가 서버 1 ID인지 확인
+    if member.guild.id == SERVER1_ID:
+        auth_channel = member.guild.get_channel(SERVER1_AUTH_CHANNEL_ID)
+        if not auth_channel:
+            try: auth_channel = await bot.fetch_channel(SERVER1_AUTH_CHANNEL_ID)
+            except Exception: auth_channel = None
+
+        if auth_channel:
+            # 해당 서버의 관리자 권한을 가진 그룹을 태그하거나 단어로 언급할 수 있도록 구성
+            # 요청하신 멘션 양식을 완벽히 준수하여 일반 텍스트 전송
+            welcome_msg = (
+                f"안녕하세요 {member.mention}님! 인증방에 닉/성별/참가경로/@관리자 멘션을 하시면 서버에 참가하실수 있어요. "
+                f"단, 인증양식이 다르다면 관리자가 서버에 참가를 시키지 않을수 있으니 조심하세요!"
+            )
+            await auth_channel.send(welcome_msg)
+
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot or not message.guild:
@@ -149,7 +207,7 @@ async def manual_punish(ctx, member: discord.Member, *, reason: str = "관리자
     try: await ctx.message.delete()
     except discord.Forbidden: pass
 
-    # ⭐ [핵심 추가] 명령어를 실행하는 유저의 최상위 역할 순위가 봇의 최상위 역할 순위보다 낮거나 같으면 실행 차단
+    # 명령어를 실행하는 유저의 최상위 역할 순위가 봇의 최상위 역할 순위보다 낮거나 같으면 실행 차단
     if ctx.author.top_role.position <= ctx.guild.me.top_role.position:
         return
 
@@ -162,7 +220,7 @@ async def clear_punish(ctx, member: discord.Member):
     try: await ctx.message.delete()
     except discord.Forbidden: pass
 
-    # ⭐ [핵심 추가] 명령어를 실행하는 유저의 최상위 역할 순위가 봇의 최상위 역할 순위보다 낮거나 같으면 실행 차단
+    # 명령어를 실행하는 유저의 최상위 역할 순위가 봇의 최상위 역할 순위보다 낮거나 같으면 실행 차단
     if ctx.author.top_role.position <= ctx.guild.me.top_role.position:
         return
 
