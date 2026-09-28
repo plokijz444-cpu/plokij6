@@ -158,10 +158,51 @@ async def on_message(message: discord.Message):
             try: await message.delete() 
             except discord.Forbidden: pass
             
-            detailed_reason = f"금지어 `[{word}]` 사용 검열\n**[적발된 문장 원본]**\n|| {original_sentence} ||"
+            detailed_reason = f"금지어 `[{word}]` 사용 검열
+**[적발된 문장 원본]**
+|| {original_sentence} ||"
             
             await punish_user(message.guild, message.author, detailed_reason, "시스템 자동 검열")
             return
+
+# !인증완료 @사용자 @남자(또는 @여자) 명령어
+@bot.command(name="인증완료")
+@commands.has_permissions(manage_roles=True)  # 역할을 관리할 수 있는 권한 필요
+async def approve_auth(ctx, member: discord.Member, gender_role: discord.Role):
+    try: 
+        await ctx.message.delete()
+    except discord.Forbidden: 
+        pass
+
+    # '지원핑' 역할 찾기 (없으면 자동 생성)
+    support_role = discord.utils.get(ctx.guild.roles, name="지원핑")
+    if not support_role:
+        try:
+            support_role = await ctx.guild.create_role(name="지원핑", reason="인증 시스템 자동 생성")
+        except discord.Forbidden:
+            await ctx.send("❌ '지원핑' 역할을 생성할 권한이 봇에게 없습니다.", delete_after=5)
+            return
+
+    # 'end' 역할 찾기 (없으면 자동 생성)
+    end_role = discord.utils.get(ctx.guild.roles, name="end")
+    if not end_role:
+        try:
+            end_role = await ctx.guild.create_role(name="end", reason="인증 시스템 자동 생성")
+        except discord.Forbidden:
+            await ctx.send("❌ 'end' 역할을 생성할 권한이 봇에게 없습니다.", delete_after=5)
+            return
+
+    try:
+        # 성별역할, 지원핑, end 역할을 동시에 유저에게 부여
+        await member.add_roles(gender_role, support_role, end_role, reason=f"{ctx.author.name} 관리자의 인증 승인 완료")
+        
+        # 완료 메시지 출력
+        await ctx.send(f"축하합니다 {member.mention}님! 인증이 성공적으로 완료되었어요!")
+
+    except discord.Forbidden:
+        await ctx.send("❌ 봇의 역할 순위가 부여하려는 역할보다 낮아 역할을 줄 수 없습니다. 서버 설정에서 봇의 역할을 위로 올려주세요.")
+    except Exception as e:
+        await ctx.send(f"❌ 인증 처리 중 에러가 발생했습니다: `{e}`")
 
 # !제재 @사용자 (사유) 명령어
 @bot.command(name="제재")
