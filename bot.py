@@ -26,16 +26,15 @@ SERVER_CONFIG = {
     1543921157101854820: 1553219199084798054   # 서버 3 ID : 제재방 3 ID
 }
 
-# ⭐ 서버 1 전용 인증방 ID 설정
+# 서버 1 전용 인증방 설정
 SERVER1_ID = 1553762662868058164
 SERVER1_AUTH_CHANNEL_ID = 1554061009302585384
 
 BANNED_WORDS = ["장애","애미","느금","너엄","너애미","너애비","느금마","느금빠","느개비","느그애비","애비","창녀","창년","보지","봊이","자지","섹스","섹x","정액"]
 
-# [수정] 중복되던 인텐트 및 봇 정의를 하나로 깔끔하게 통합했습니다.
 intents = discord.Intents.default()
-intents.message_content = True  # 메시지 내용 읽기 권한
-intents.members = True          # 서버 멤버 관리 권한 (입장 감지 및 역할 지급에 필수)
+intents.message_content = True  
+intents.members = True          
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -50,7 +49,6 @@ async def punish_user(guild: discord.Guild, member: discord.Member, reason: str,
         try: log_channel = await bot.fetch_channel(log_channel_id)
         except Exception: log_channel = None
 
-    # 1. 유저의 현재 전과 등급 실시간 파싱 및 지울 역할 수집
     current_count = 0
     roles_to_remove = []
     for r in member.roles:
@@ -61,11 +59,9 @@ async def punish_user(guild: discord.Guild, member: discord.Member, reason: str,
             except ValueError:
                 continue
 
-    # 전과 1범씩 정상 누적 (0이면 1부터 시작)
     current_count += 1
 
     try:
-        # 20범 도달 시 -> 영구 차단(BAN) 임베드 박스 전송
         if current_count >= 20:
             await member.ban(reason=f"전과 20범 달성 ({reason})")
             if log_channel:
@@ -79,7 +75,6 @@ async def punish_user(guild: discord.Guild, member: discord.Member, reason: str,
 
         role_name = f"전과 {current_count}범"
         
-        # 역할 자동 생성 및 기존 전과 역할 교체
         role = discord.utils.get(guild.roles, name=role_name)
         if not role:
             role = await guild.create_role(name=role_name, reason="전과 시스템 자동 생성")
@@ -88,14 +83,12 @@ async def punish_user(guild: discord.Guild, member: discord.Member, reason: str,
             await member.remove_roles(*roles_to_remove)
         await member.add_roles(role)
 
-        # 타임아웃 적용 (최대 28일 제한 보호 적용)
         punish_days = min(current_count, 28)
         duration = datetime.timedelta(days=punish_days)
         target_time = discord.utils.utcnow() + duration
         
         await member.edit(timed_out_until=target_time, reason=f"{role_name} 제재 ({reason})")
 
-        # 2. 네모 박스(Embed) 제재 로그 전송
         if log_channel:
             embed = discord.Embed(title="⚠️ 유저 제재 알림", color=discord.Color.orange(), timestamp=discord.utils.utcnow())
             embed.add_field(name="👤 대상자", value=f"{member.mention} ({member.name})", inline=True)
@@ -119,7 +112,6 @@ async def punish_user(guild: discord.Guild, member: discord.Member, reason: str,
 async def on_ready():
     print(f"🤖 {bot.user.name} 봇이 모든 시스템 수정을 마치고 가동되었습니다.")
 
-# 서버 1 입장을 감지하여 인증 채널에 맞춤 멘션 메시지를 전송하는 이벤트
 @bot.event
 async def on_member_join(member: discord.Member):
     if member.guild.id == SERVER1_ID:
@@ -135,22 +127,97 @@ async def on_member_join(member: discord.Member):
             )
             await auth_channel.send(welcome_msg)
 
+# 명령어 인자 식별 오류 및 잘림 현상 조율 완료
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot or not message.guild:
         return
 
-    # 관리자 명령어 우회 처리 (!로 시작하면 검열 건너뛰고 명령어로 처리)
+    # 1. !인증완료 명령어 직접 파싱 (우선순위 최고 단계 설정)
+    if message.content.startswith("!인증완료"):
+        # 서버 1의 지정된 인증 채널이 아니면 무시
+        if message.channel.id != SERVER1_AUTH_CHANNEL_ID:
+            return
+
+        # '역할 관리' 권한이 있는 관리자만 사용 가능하게 보안 검증
+        if not message.author.guild_permissions.manage_roles:
+            return
+
+        # 원본 명령어 메시지 즉시 삭제로 채널 보호
+        try: await message.delete()
+        except discord.Forbidden: pass
+
+        # 인자 분석 (!인증완료 @유저 멘션 성별)
+        args = message.content.split()
+        if len(args) < 3:
+            await message.channel.send("⚠️ 형식이 올바르지 않습니다. `!인증완료 @사용자 남자(또는 여자)` 형태로 입력해주세요.", delete_after=5)
+            return
+
+        gender = args[-1]  # 마지막 인자 ('남자' 또는 '여자')
+        
+        # 멘션 리스트에서 유저 객체 획득
+        if not message.mentions:
+            await message.channel.send("⚠️ 인증할 대상을 올바르게 멘션해 주세요.", delete_after=5)
+            return
+        
+        target_member = message.mentions[0]  # 첫 번째 멘션된 유저를 타겟 지정
+
+        # 서버 내 역할 검색
+        role_jiwon = discord.utils.get(message.guild.roles, name="지원핑")
+        role_end = discord.utils.get(message.guild.roles, name="end")
+        role_man = discord.utils.get(message.guild.roles, name="남자")
+        role_woman = discord.utils.get(message.guild.roles, name="여자")
+
+        if not (role_jiwon and role_end and role_man and role_woman):
+            await message.channel.send("⚠️ 서버 설정에 '남자', '여자', '지원핑', 'end' 역할이 모두 존재하는지 확인해 주세요.", delete_after=5)
+            return
+
+        roles_to_add = [role_jiwon, role_end]
+        roles_to_remove = []
+
+        # 성별에 따른 교정 및 교체 매커니즘
+        if gender == "남자":
+            roles_to_add.append(role_man)
+            if role_woman in target_member.roles:
+                roles_to_remove.append(role_woman)
+        elif gender == "여자":
+            roles_to_add.append(role_woman)
+            if role_man in target_member.roles:
+                roles_to_remove.append(role_man)
+        else:
+            await message.channel.send("⚠️ 성별은 '남자' 또는 '여자'로 입력해 주세요.", delete_after=5)
+            return
+
+        try:
+            # 이전 성별 역할이 있다면 먼저 회수 진행
+            if roles_to_remove:
+                await target_member.remove_roles(*roles_to_remove)
+            
+            # 대상 유저에게 역할 일괄 세트 지급
+            await target_member.add_roles(*roles_to_add)
+            
+            # 약속된 축하 안내 메시지 출력
+            await message.channel.send(f"축하합니다! {target_member.mention}님의 인증이 완료되었어요!")
+            return
+            
+        except discord.Forbidden:
+            await message.channel.send("❌ 봇의 역할 서열이 낮습니다. 서버 설정 ➡️ 역할 메뉴에서 봇 역할을 관련 역할들보다 위로 올려주세요.")
+            return
+        except Exception as e:
+            await message.channel.send(f"❌ 시스템 내부 오류 발생: `{e}`")
+            return
+
+    # 2. 일반 접두사 명령어 처리 우회
     if message.content.startswith("!"):
         await bot.process_commands(message)
         return
 
-    # 일반 채팅 안녕 반응 기능
+    # 3. 일반 채팅 안녕 반응 기능
     if message.content == "안녕":
         await message.channel.send(f"안녕하세요, {message.author.mention}님! 반가워요.")
         return
 
-    # 일반 채팅 자동 금지어 검열 시스템
+    # 4. 일반 채팅 자동 금지어 검열 시스템
     for word in BANNED_WORDS:
         if word in message.content:
             original_sentence = message.content
@@ -158,7 +225,9 @@ async def on_message(message: discord.Message):
             try: await message.delete() 
             except discord.Forbidden: pass
             
-            detailed_reason = f"금지어 `[{word}]` 사용 검열\n**[적발된 문장 원본]**\n|| {original_sentence} ||"
+            detailed_reason = f"금지어 `[{word}]` 사용 검열
+**[적발된 문장 원본]**
+|| {original_sentence} ||"
             
             await punish_user(message.guild, message.author, detailed_reason, "시스템 자동 검열")
             return
@@ -238,25 +307,6 @@ async def clear_punish(ctx, member: discord.Member):
         if log_channel:
             await log_channel.send(f"❌ **제재 해제 중 시스템 에러 발생:** `{e}`")
 
-# ⭐ [최종 추가 및 조율 완료] !인증완료 @유저 멘션 남자/여자
-@bot.command(name="인증완료")
-@commands.has_permissions(manage_roles=True)  # 역할 관리 권한이 있는 관리자만 사용 가능
-async def verify(ctx, member: discord.Member, gender: str):
-    # 1. 서버 1의 지정된 인증 채널(SERVER1_AUTH_CHANNEL_ID)이 맞는지 검증
-    if ctx.channel.id != SERVER1_AUTH_CHANNEL_ID:
-        return
-
-    # 2. 관리자가 입력한 명령어 메시지 즉시 삭제 (인증 채널 정리)
-    try: 
-        await ctx.message.delete()
-    except discord.Forbidden: 
-        pass
-
-    # 3. 서버에서 각 역할 객체 가져오기
-    role_jiwon = discord.utils.get(ctx.guild.roles, name="지원핑")
-    role_end = discord.utils.get(ctx.guild.roles, name="end")
-    role_man = discord.utils.get(ctx.guild.roles, name="남자")
-    role_woman = discord.utils.get(ctx.guild.roles, name="여자")
-    
-    # 4. 서버 내 필요한 역할들이 모두 존재하는지 검증
-    if not (role_jiwon and role_end and role_man and role_woman):
+# ================= [ 봇 실행 ] =================
+keep_alive() 
+bot.run(os.getenv("DISCORD_TOKEN"))
