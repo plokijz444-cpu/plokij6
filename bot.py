@@ -20,9 +20,8 @@ def keep_alive():
     t.start()
 
 # ================= [ 디스코드 봇 설정 & 데이터 ] =================
-# ⭐ [수정] 요청하신 서버 1의 길드 ID와 제재방 ID를 정확하게 업데이트했습니다.
 SERVER_CONFIG = {
-    1553762662868058164: 1554055050819670036,  # 서버 1 ID : 제재방 1 ID (업데이트 완료)
+    1553762662868058164: 1554055050819670036,  # 서버 1 ID : 제재방 1 ID
     1529347274403086468: 1546457831631224843,  # 서버 2 ID : 제재방 2 ID
     1543921157101854820: 1553219199084798054   # 서버 3 ID : 제재방 3 ID
 }
@@ -78,7 +77,7 @@ async def punish_user(guild: discord.Guild, member: discord.Member, reason: str,
         # 역할 자동 생성 및 기존 전과 역할 교체
         role = discord.utils.get(guild.roles, name=role_name)
         if not role:
-            role = await guild.create_role(name=role_name, reason="전과 시스템 자동 생성")
+            role = await guild.create_role(name=name, reason="전과 시스템 자동 생성")
 
         if roles_to_remove:
             await member.remove_roles(*roles_to_remove)
@@ -150,14 +149,22 @@ async def manual_punish(ctx, member: discord.Member, *, reason: str = "관리자
     try: await ctx.message.delete()
     except discord.Forbidden: pass
 
+    # ⭐ [핵심 추가] 명령어를 실행하는 유저의 최상위 역할 순위가 봇의 최상위 역할 순위보다 낮거나 같으면 실행 차단
+    if ctx.author.top_role.position <= ctx.guild.me.top_role.position:
+        return
+
     await punish_user(ctx.guild, member, reason, ctx.author.mention)
 
-# ⭐ [핵심 수정] !제재지우기 실행 시 전과를 완전 리셋하는 대신 '한 단계 감면' 하도록 로직 변경
+# !제재지우기 @사용자 명령어
 @bot.command(name="제재지우기")
 @commands.has_permissions(moderate_members=True)
 async def clear_punish(ctx, member: discord.Member):
     try: await ctx.message.delete()
     except discord.Forbidden: pass
+
+    # ⭐ [핵심 추가] 명령어를 실행하는 유저의 최상위 역할 순위가 봇의 최상위 역할 순위보다 낮거나 같으면 실행 차단
+    if ctx.author.top_role.position <= ctx.guild.me.top_role.position:
+        return
 
     guild_id = ctx.guild.id
     if guild_id not in SERVER_CONFIG:
@@ -170,7 +177,7 @@ async def clear_punish(ctx, member: discord.Member):
         except Exception: log_channel = None
 
     try:
-        # 타임아웃 강제 해제 (None 대입)
+        # 타임아웃 강제 해제
         await member.edit(timed_out_until=None, reason="관리자가 제재 감면 및 해제")
 
         # 유저의 현재 전과 단계를 파악하고 기존 전과 역할을 수집합니다.
@@ -184,16 +191,14 @@ async def clear_punish(ctx, member: discord.Member):
                 except ValueError:
                     continue
 
-        # 기존 전과 역할들은 일단 모두 제거합니다.
         if roles_to_remove:
             await member.remove_roles(*roles_to_remove)
 
-        # 전과를 한 단계 차감합니다 (예: 3범 -> 2범). 이미 1범 이하이거나 전과가 없었다면 0이 됩니다.
+        # 전과 한 단계 차감
         next_count = max(0, current_count - 1)
 
         action_description = ""
         if next_count > 0:
-            # 낮아진 단계의 전과 역할을 새로 부여합니다 (예: 전과 2범 부여).
             new_role_name = f"전과 {next_count}범"
             role = discord.utils.get(ctx.guild.roles, name=new_role_name)
             if not role:
@@ -203,7 +208,6 @@ async def clear_punish(ctx, member: discord.Member):
         else:
             action_description = f"대상자의 타임아웃을 해제하고 누적되어 있던 전과 단계를 모두 초기화(0범)했습니다."
 
-        # 네모 상자(Embed) 제재 감면/해제 로그 전송
         if log_channel:
             embed = discord.Embed(title="🔓 유저 제재 감면 및 해제", color=discord.Color.green(), timestamp=discord.utils.utcnow())
             embed.add_field(name="👤 대상자", value=f"{member.mention} ({member.name})", inline=True)
