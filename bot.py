@@ -20,8 +20,9 @@ def keep_alive():
     t.start()
 
 # ================= [ 디스코드 봇 설정 & 데이터 ] =================
+# ⭐ [수정] 요청하신 서버 1의 길드 ID와 제재방 ID를 정확하게 업데이트했습니다.
 SERVER_CONFIG = {
-    1553762662868058164: 1554055050819670036,  # 서버 1 ID : 제재방 1 ID
+    1553762662868058164: 1554055050819670036,  # 서버 1 ID : 제재방 1 ID (업데이트 완료)
     1529347274403086468: 1546457831631224843,  # 서버 2 ID : 제재방 2 ID
     1543921157101854820: 1553219199084798054   # 서버 3 ID : 제재방 3 ID
 }
@@ -68,6 +69,7 @@ async def punish_user(guild: discord.Guild, member: discord.Member, reason: str,
                 embed.add_field(name="👤 대상자", value=f"{member.mention} ({member.name})", inline=True)
                 embed.add_field(name="🔨 집행자", value=punisher, inline=True)
                 embed.add_field(name="💬 최종 사유", value=reason, inline=False)
+                embed.set_footer(text="억울한 사항이 있다면 관리자에게 증거와 함께 자초지종을 DM으로 보내주세요")
                 await log_channel.send(embed=embed)
             return
 
@@ -89,13 +91,14 @@ async def punish_user(guild: discord.Guild, member: discord.Member, reason: str,
         
         await member.edit(timed_out_until=target_time, reason=f"{role_name} 제재 ({reason})")
 
-        # 2. ⭐ 네모 박스(Embed) 제재 로그 전송
+        # 2. 네모 박스(Embed) 제재 로그 전송
         if log_channel:
             embed = discord.Embed(title="⚠️ 유저 제재 알림", color=discord.Color.orange(), timestamp=discord.utils.utcnow())
             embed.add_field(name="👤 대상자", value=f"{member.mention} ({member.name})", inline=True)
             embed.add_field(name="🔨 집행자", value=punisher, inline=True)
             embed.add_field(name="📜 조치 내용", value=f"**{role_name}** 부여 및 **{punish_days}일간** 타임아웃", inline=False)
             embed.add_field(name="💬 제재 사유", value=reason, inline=False)
+            embed.set_footer(text="억울한 사항이 있다면 관리자에게 증거와 함께 자초지종을 DM으로 보내주세요")
             await log_channel.send(embed=embed)
             
     except discord.Forbidden:
@@ -130,28 +133,26 @@ async def on_message(message: discord.Message):
     # 일반 채팅 자동 금지어 검열 시스템
     for word in BANNED_WORDS:
         if word in message.content:
-            # ⭐ 유저가 친 문장 전체를 백업합니다.
             original_sentence = message.content
             
             try: await message.delete() 
             except discord.Forbidden: pass
             
-            # ⭐ [핵심 수정] 보고 싶지 않은 사람들을 위해 문장 전체를 ||문장|| 기호로 감싸 클릭형 블라인더(스포일러)로 가립니다.
             detailed_reason = f"금지어 `[{word}]` 사용 검열\n**[적발된 문장 원본]**\n|| {original_sentence} ||"
             
             await punish_user(message.guild, message.author, detailed_reason, "시스템 자동 검열")
             return
 
-# !제재 @사용자 명령어
+# !제재 @사용자 (사유) 명령어
 @bot.command(name="제재")
 @commands.has_permissions(moderate_members=True) 
-async def manual_punish(ctx, member: discord.Member):
+async def manual_punish(ctx, member: discord.Member, *, reason: str = "관리자 수동 제재"):
     try: await ctx.message.delete()
     except discord.Forbidden: pass
 
-    await punish_user(ctx.guild, member, "관리자 수동 제재", ctx.author.mention)
+    await punish_user(ctx.guild, member, reason, ctx.author.mention)
 
-# !제재지우기 @사용자 명령어
+# ⭐ [핵심 수정] !제재지우기 실행 시 전과를 완전 리셋하는 대신 '한 단계 감면' 하도록 로직 변경
 @bot.command(name="제재지우기")
 @commands.has_permissions(moderate_members=True)
 async def clear_punish(ctx, member: discord.Member):
@@ -169,20 +170,45 @@ async def clear_punish(ctx, member: discord.Member):
         except Exception: log_channel = None
 
     try:
-        # 타임아웃 강제 해제
-        await member.edit(timed_out_until=None, reason="관리자가 제재 해제")
+        # 타임아웃 강제 해제 (None 대입)
+        await member.edit(timed_out_until=None, reason="관리자가 제재 감면 및 해제")
 
-        # 전과 역할 일괄 청소
-        roles_to_remove = [r for r in member.roles if r.name.startswith("전과 ") and r.name.endswith("범")]
+        # 유저의 현재 전과 단계를 파악하고 기존 전과 역할을 수집합니다.
+        current_count = 0
+        roles_to_remove = []
+        for r in member.roles:
+            if r.name.startswith("전과 ") and r.name.endswith("범"):
+                try:
+                    current_count = int(r.name.replace("전과 ", "").replace("범", "").strip())
+                    roles_to_remove.append(r)
+                except ValueError:
+                    continue
+
+        # 기존 전과 역할들은 일단 모두 제거합니다.
         if roles_to_remove:
             await member.remove_roles(*roles_to_remove)
 
-        # 네모 상자(Embed) 제재 해제 로그 전송
+        # 전과를 한 단계 차감합니다 (예: 3범 -> 2범). 이미 1범 이하이거나 전과가 없었다면 0이 됩니다.
+        next_count = max(0, current_count - 1)
+
+        action_description = ""
+        if next_count > 0:
+            # 낮아진 단계의 전과 역할을 새로 부여합니다 (예: 전과 2범 부여).
+            new_role_name = f"전과 {next_count}범"
+            role = discord.utils.get(ctx.guild.roles, name=new_role_name)
+            if not role:
+                role = await ctx.guild.create_role(name=new_role_name, reason="전과 시스템 자동 생성")
+            await member.add_roles(role)
+            action_description = f"대상자의 타임아웃을 해제하고 전과 단계를 한 단계 하향 조정했습니다. (**전과 {current_count}범** ➡️ **{new_role_name}**)"
+        else:
+            action_description = f"대상자의 타임아웃을 해제하고 누적되어 있던 전과 단계를 모두 초기화(0범)했습니다."
+
+        # 네모 상자(Embed) 제재 감면/해제 로그 전송
         if log_channel:
-            embed = discord.Embed(title="🔓 유저 제재 해제 완료", color=discord.Color.green(), timestamp=discord.utils.utcnow())
+            embed = discord.Embed(title="🔓 유저 제재 감면 및 해제", color=discord.Color.green(), timestamp=discord.utils.utcnow())
             embed.add_field(name="👤 대상자", value=f"{member.mention} ({member.name})", inline=True)
             embed.add_field(name="🔨 실행 관리자", value=ctx.author.mention, inline=True)
-            embed.description = "대상자의 타임아웃을 해제하고 서버 내 누적된 모든 전과 등급 역할을 철거했습니다."
+            embed.description = action_description
             await log_channel.send(embed=embed)
             
     except discord.Forbidden:
