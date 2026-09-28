@@ -32,9 +32,10 @@ SERVER1_AUTH_CHANNEL_ID = 1554061009302585384
 
 BANNED_WORDS = ["장애","애미","느금","너엄","너애미","너애비","느금마","느금빠","느개비","느그애비","애비","창녀","창년","보지","봊이","자지","섹스","섹x","정액"]
 
+# [수정] 중복되던 인텐트 및 봇 정의를 하나로 깔끔하게 통합했습니다.
 intents = discord.Intents.default()
 intents.message_content = True  # 메시지 내용 읽기 권한
-intents.members = True          # 서버 멤버 관리 권한 (입장 감지에 필수)
+intents.members = True          # 서버 멤버 관리 권한 (입장 감지 및 역할 지급에 필수)
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -237,7 +238,7 @@ async def clear_punish(ctx, member: discord.Member):
         if log_channel:
             await log_channel.send(f"❌ **제재 해제 중 시스템 에러 발생:** `{e}`")
 
-# ⭐ [추가된 명령어] !인증완료 @유저 멘션 남자/여자
+# ⭐ [최종 추가 및 조율 완료] !인증완료 @유저 멘션 남자/여자
 @bot.command(name="인증완료")
 @commands.has_permissions(manage_roles=True)  # 역할 관리 권한이 있는 관리자만 사용 가능
 async def verify(ctx, member: discord.Member, gender: str):
@@ -245,18 +246,17 @@ async def verify(ctx, member: discord.Member, gender: str):
     if ctx.channel.id != SERVER1_AUTH_CHANNEL_ID:
         return
 
-    # 2. 고정 지급할 역할 객체 가져오기
+    # 2. 관리자가 입력한 명령어 메시지 즉시 삭제 (인증 채널 정리)
+    try: 
+        await ctx.message.delete()
+    except discord.Forbidden: 
+        pass
+
+    # 3. 서버에서 각 역할 객체 가져오기
     role_jiwon = discord.utils.get(ctx.guild.roles, name="지원핑")
     role_end = discord.utils.get(ctx.guild.roles, name="end")
+    role_man = discord.utils.get(ctx.guild.roles, name="남자")
+    role_woman = discord.utils.get(ctx.guild.roles, name="여자")
     
-    # 3. 입력된 성별 텍스트에 따른 유연한 역할 매칭
-    if gender == "남자":
-        role_gender = discord.utils.get(ctx.guild.roles, name="남자")
-    elif gender == "여자":
-        role_gender = discord.utils.get(ctx.guild.roles, name="여자")
-    else:
-        await ctx.send("⚠️ 성별은 '남자' 또는 '여자'로 정확히 입력해 주세요.")
-        return
-
-    # 4. 서버 내 역할 이름 존재 여부 최종 검증
-    if not (role_jiwon and role_end and role_gender):
+    # 4. 서버 내 필요한 역할들이 모두 존재하는지 검증
+    if not (role_jiwon and role_end and role_man and role_woman):
