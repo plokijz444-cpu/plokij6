@@ -121,7 +121,6 @@ async def on_ready():
 # 서버 1 입장을 감지하여 인증 채널에 맞춤 멘션 메시지를 전송하는 이벤트
 @bot.event
 async def on_member_join(member: discord.Member):
-    # 신규 입장한 서버의 ID가 서버 1 ID인지 확인
     if member.guild.id == SERVER1_ID:
         auth_channel = member.guild.get_channel(SERVER1_AUTH_CHANNEL_ID)
         if not auth_channel:
@@ -140,7 +139,7 @@ async def on_message(message: discord.Message):
     if message.author.bot or not message.guild:
         return
 
-    # 관리자 명령어 우회 처리
+    # [수정] 명령어 입력 시 즉시 처리 후 이벤트 종료 (충돌 방지 보완)
     if message.content.startswith("!"):
         await bot.process_commands(message)
         return
@@ -167,12 +166,24 @@ async def on_message(message: discord.Message):
 
 # !인증완료 @사용자 @남자(또는 @여자) 명령어
 @bot.command(name="인증완료")
-@commands.has_permissions(manage_roles=True)  # 역할을 관리할 수 있는 권한 필요
-async def approve_auth(ctx, member: discord.Member, gender_role: discord.Role):
+@commands.has_permissions(manage_roles=True)
+async def approve_auth(ctx, member: discord.Member, gender_input: str):
     try: 
         await ctx.message.delete()
     except discord.Forbidden: 
         pass
+
+    # 성별 인자 변환 (멘션 형태와 일반 텍스트 모두 지원하는 안전장치)
+    gender_role = None
+    if gender_input.startswith("<@&") and gender_input.endswith(">"):
+        role_id = int(gender_input.replace("<@&", "").replace(">", ""))
+        gender_role = ctx.guild.get_role(role_id)
+    else:
+        gender_role = discord.utils.get(ctx.guild.roles, name=gender_input)
+
+    if not gender_role:
+        await ctx.send(f"❌ 서버에서 `{gender_input}` 역할을 찾을 수 없습니다.", delete_after=5)
+        return
 
     # '지원핑' 역할 찾기 (없으면 자동 생성)
     support_role = discord.utils.get(ctx.guild.roles, name="지원핑")
@@ -193,10 +204,8 @@ async def approve_auth(ctx, member: discord.Member, gender_role: discord.Role):
             return
 
     try:
-        # 성별역할, 지원핑, end 역할을 동시에 유저에게 부여
+        # 세 가지 역할을 유저에게 동시 부여
         await member.add_roles(gender_role, support_role, end_role, reason=f"{ctx.author.name} 관리자의 인증 승인 완료")
-        
-        # 완료 메시지 출력
         await ctx.send(f"축하합니다 {member.mention}님! 인증이 성공적으로 완료되었어요!")
 
     except discord.Forbidden:
@@ -211,7 +220,6 @@ async def manual_punish(ctx, member: discord.Member, *, reason: str = "관리자
     try: await ctx.message.delete()
     except discord.Forbidden: pass
 
-    # 명령어를 실행하는 유저의 최상위 역할 순위가 봇의 최상위 역할 순위보다 낮거나 같으면 실행 차단
     if ctx.author.top_role.position <= ctx.guild.me.top_role.position:
         return
 
@@ -224,7 +232,6 @@ async def clear_punish(ctx, member: discord.Member):
     try: await ctx.message.delete()
     except discord.Forbidden: pass
 
-    # 명령어를 실행하는 유저의 최상위 역할 순위가 봇의 최상위 역할 순위보다 낮거나 같으면 실행 차단
     if ctx.author.top_role.position <= ctx.guild.me.top_role.position:
         return
 
@@ -239,10 +246,8 @@ async def clear_punish(ctx, member: discord.Member):
         except Exception: log_channel = None
 
     try:
-        # 타임아웃 강제 해제
         await member.edit(timed_out_until=None, reason="관리자가 제재 감면 및 해제")
 
-        # 유저의 현재 전과 단계를 파악하고 기존 전과 역할을 수집합니다.
         current_count = 0
         roles_to_remove = []
         for r in member.roles:
@@ -256,7 +261,6 @@ async def clear_punish(ctx, member: discord.Member):
         if roles_to_remove:
             await member.remove_roles(*roles_to_remove)
 
-        # 전과 한 단계 차감
         next_count = max(0, current_count - 1)
 
         action_description = ""
