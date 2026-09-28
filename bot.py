@@ -171,6 +171,11 @@ async def approve_auth(ctx, member: discord.Member, gender_input: str):
     except discord.Forbidden: 
         pass
 
+    # 지정된 인증방 ID(1554061009302585384)가 아니면 명령어 작동 차단
+    if ctx.channel.id != SERVER1_AUTH_CHANNEL_ID:
+        await ctx.send("❌ 이 명령어는 지정된 인증방 채널에서만 사용할 수 있습니다.", delete_after=5)
+        return
+
     # 성별 인자 변환 (멘션 형태와 일반 텍스트 모두 지원하는 안전장치)
     gender_role = None
     if gender_input.startswith("<@&") and gender_input.endswith(">"):
