@@ -195,9 +195,7 @@ async def on_message(message: discord.Message):
             try: await message.delete() 
             except discord.Forbidden: pass
             
-            detailed_reason = f"금지어 `[{word}]` 사용 검열
-**[적발된 문장 원본]**
-|| {original_sentence} ||"
+            detailed_reason = f"금지어 `[{word}]` 사용 검열 | 적발된 문장 원본: || {original_sentence} ||"
             await punish_user(message.guild, message.author, detailed_reason, "시스템 자동 검열")
             return
 
