@@ -10,13 +10,15 @@ app = Flask('')
 
 @app.route('/')
 def home():
-    return "Bot is running!"
+    return "Bot is running perfectly!"
 
 def run():
-    app.run(host='0.0.0.0', port=8080)
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host='0.0.0.0', port=port)
 
 def keep_alive():
     t = Thread(target=run)
+    t.daemon = True  
     t.start()
 
 # ================= [ 디스코드 봇 설정 & 데이터 ] =================
@@ -24,20 +26,19 @@ SERVER_CONFIG = {
     1553762662868058164: 1554055050819670036,  # 서버 1 ID : 제재방 1 ID
     1529347274403086468: 1546457831631224843,  # 서버 2 ID : 제재방 2 ID
     1543921157101854820: 1553219199084798054,  # 서버 3 ID : 제재방 3 ID
-    1555119957623185419: 1555595932270198875   # 서버 4 ID : 제재방 4 ID
+    1555119957623185419: 1555595932270198875   # 서버 4 ID : 제재방 4 ID (추가됨)
 }
 
-# 서버 1 전용 채널 ID 설정
 SERVER1_ID = 1553762662868058164
 SERVER1_AUTH_CHANNEL_ID = 1554061009302585384
-SERVER1_JOIN_LOG_CHANNEL_ID = 1554077665739407360   # 입장 로그 채널
-SERVER1_LEAVE_LOG_CHANNEL_ID = 1554078156695142542  # 퇴장 로그 채널
+SERVER1_JOIN_LOG_CHANNEL_ID = 1554077665739407360   
+SERVER1_LEAVE_LOG_CHANNEL_ID = 1554078156695142542  
 
 BANNED_WORDS = ["장애","애미","느금","너엄","너애미","너애비","느금마","느금빠","느개비","느그애비","애비","창녀","창년","보지","봊이","자지","섹스","섹x","정액"]
 
 intents = discord.Intents.default()
-intents.message_content = True  # 메시지 내용 읽기 권한
-intents.members = True          # 서버 멤버 관리 권한 (입장/퇴장 감지에 필수)
+intents.message_content = True  
+intents.members = True          
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -65,40 +66,39 @@ async def punish_user(guild: discord.Guild, member: discord.Member, reason: str,
     current_count += 1
 
     try:
-        # 1. 역할 생성/부여 및 삭제 처리
-        if current_count < 20:
-            role_name = f"전과 {current_count}범"
-            role = discord.utils.get(guild.roles, name=role_name)
-            if not role:
-                role = await guild.create_role(name=role_name, reason="전과 시스템 자동 생성")
-
-            if roles_to_remove:
-                await member.remove_roles(*roles_to_remove)
-            await member.add_roles(role)
-
-        # 2. 타임아웃 또는 영구 차단 실행
+        # 1. 전과 20범 이상 영구 차단 검사 우선 진행
         if current_count >= 20:
             await member.ban(reason=f"전과 20범 달성 ({reason})")
             if log_channel:
                 embed = discord.Embed(title="🚨 유저 영구 차단 (BAN)", color=discord.Color.red(), timestamp=discord.utils.utcnow())
                 embed.add_field(name="👤 대상자", value=f"{member.mention} ({member.name})", inline=True)
-                embed.add_field(name="🔨 집행자", value=punisher, inline=True)
+                embed.add_field(name="🔨 집행자", value=str(punisher), inline=True)
                 embed.add_field(name="💬 최종 사유", value=reason, inline=False)
                 embed.set_footer(text="억울한 사항이 있다면 관리자에게 증거와 함께 자초지종을 DM으로 보내주세요")
                 await log_channel.send(embed=embed)
             return
 
+        # 2. 타임아웃 처리 (가장 신뢰도가 높은 디스코드 자체 기능 우선 수행)
         punish_days = min(current_count, 28)
         duration = datetime.timedelta(days=punish_days)
         target_time = discord.utils.utcnow() + duration
-        
-        await member.edit(timed_out_until=target_time, reason=f"{role_name} 제재 ({reason})")
+        await member.edit(timed_out_until=target_time, reason=f"전과 {current_count}범 제재 ({reason})")
 
-        # 3. 제재방 로그 전송
+        # 3. 전과 역할 업데이트 로직 진행
+        role_name = f"전과 {current_count}범"
+        role = discord.utils.get(guild.roles, name=role_name)
+        if not role:
+            role = await guild.create_role(name=role_name, reason="전과 시스템 자동 생성")
+
+        if roles_to_remove:
+            await member.remove_roles(*roles_to_remove)
+        await member.add_roles(role)
+
+        # 4. 제재방 로그 전송
         if log_channel:
             embed = discord.Embed(title="⚠️ 유저 제재 알림", color=discord.Color.orange(), timestamp=discord.utils.utcnow())
             embed.add_field(name="👤 대상자", value=f"{member.mention} ({member.name})", inline=True)
-            embed.add_field(name="🔨 집행자", value=punisher, inline=True)
+            embed.add_field(name="🔨 집행자", value=str(punisher), inline=True)
             embed.add_field(name="📜 조치 내용", value=f"**{role_name}** 부여 및 **{punish_days}일간** 타임아웃", inline=False)
             embed.add_field(name="💬 제재 사유", value=reason, inline=False)
             embed.set_footer(text="억울한 사항이 있다면 관리자에게 증거와 함께 자초지종을 DM으로 보내주세요")
@@ -113,12 +113,11 @@ async def punish_user(guild: discord.Guild, member: discord.Member, reason: str,
         if log_channel:
             await log_channel.send(f"❌ **제재 실행 중 시스템 에러 발생:** `{e}`")
 
-# ================= [ 이벤트 및 명령어 처리 ] =================
+# ================= [ 이벤트 처리 ] =================
 @bot.event
 async def on_ready():
-    print(f"🤖 {bot.user.name} 봇이 모든 시스템 수정을 마치고 가동되었습니다.")
+    print(f"🤖 {bot.user.name} 봇이 가동되었습니다.")
 
-# 서버 입장 감지 이벤트
 @bot.event
 async def on_member_join(member: discord.Member):
     if member.guild.id != SERVER1_ID:
@@ -138,7 +137,7 @@ async def on_member_join(member: discord.Member):
 
     join_log_channel = member.guild.get_channel(SERVER1_JOIN_LOG_CHANNEL_ID)
     if not join_log_channel:
-        try: join_log_channel = await bot.fetch_channel(join_log_channel_id)
+        try: join_log_channel = await bot.fetch_channel(SERVER1_JOIN_LOG_CHANNEL_ID)
         except Exception: join_log_channel = None
 
     if join_log_channel:
@@ -150,14 +149,11 @@ async def on_member_join(member: discord.Member):
         embed.add_field(name="⏰ 입장 시간", value=now, inline=True)
         embed.add_field(name="📅 계정 생성일", value=created_at, inline=True)
         
-        if member.avatar:
-            embed.set_image(url=member.avatar.url)
-        else:
-            embed.set_image(url=member.default_avatar.url)
+        if member.avatar: embed.set_image(url=member.avatar.url)
+        else: embed.set_image(url=member.default_avatar.url)
             
         await join_log_channel.send(embed=embed)
 
-# 서버 퇴장 감지 이벤트
 @bot.event
 async def on_member_remove(member: discord.Member):
     if member.guild.id != SERVER1_ID:
@@ -175,10 +171,8 @@ async def on_member_remove(member: discord.Member):
         embed.add_field(name="👤 대상 유저", value=f"{member.name} (ID: {member.id})", inline=False)
         embed.add_field(name="⏰ 퇴장 시간", value=now, inline=False)
         
-        if member.avatar:
-            embed.set_image(url=member.avatar.url)
-        else:
-            embed.set_image(url=member.default_avatar.url)
+        if member.avatar: embed.set_image(url=member.avatar.url)
+        else: embed.set_image(url=member.default_avatar.url)
             
         await leave_log_channel.send(embed=embed)
 
@@ -187,7 +181,7 @@ async def on_message(message: discord.Message):
     if message.author.bot or not message.guild:
         return
 
-    if message.content.startswith("!"):
+    if message.content.startswith(("! ", "!")):
         await bot.process_commands(message)
         return
 
@@ -207,17 +201,14 @@ async def on_message(message: discord.Message):
             await punish_user(message.guild, message.author, detailed_reason, "시스템 자동 검열")
             return
 
-# !인증완료 @사용자 @남자(또는 @여자) 명령어
+# ================= [ 관리자 명령어 로직 ] =================
 @bot.command(name="인증완료")
 @commands.has_permissions(manage_roles=True)
 async def approve_auth(ctx, member: discord.Member, gender_input: str):
-    try: 
-        await ctx.message.delete()
-    except discord.Forbidden: 
-        pass
+    try: await ctx.message.delete()
+    except discord.Forbidden: pass
 
     if ctx.channel.id != SERVER1_AUTH_CHANNEL_ID:
-        await ctx.send("❌ 이 명령어는 지정된 인증방 채널에서만 사용할 수 있습니다.", delete_after=5)
         return
 
     gender_role = None
@@ -228,44 +219,25 @@ async def approve_auth(ctx, member: discord.Member, gender_input: str):
         gender_role = discord.utils.get(ctx.guild.roles, name=gender_input)
 
     if not gender_role:
-        await ctx.send(f"❌ 서버에서 `{gender_input}` 역할을 찾을 수 없습니다.", delete_after=5)
+        await ctx.send(f"❌ 역할을 찾을 수 없습니다: `{gender_input}`", delete_after=5)
         return
 
-    support_role = discord.utils.get(ctx.guild.roles, name="지원핑")
-    if not support_role:
-        try:
-            support_role = await ctx.guild.create_role(name="지원핑", reason="인증 시스템 자동 생성")
-        except discord.Forbidden:
-            await ctx.send("❌ '지원핑' 역할을 생성할 권한이 봇에게 없습니다.", delete_after=5)
-            return
-
-    end_role = discord.utils.get(ctx.guild.roles, name="end")
-    if not end_role:
-        try:
-            end_role = await ctx.guild.create_role(name="end", reason="인증 systems 자동 생성")
-        except discord.Forbidden:
-            await ctx.send("❌ 'end' 역할을 생성할 권한이 봇에게 없습니다.", delete_after=5)
-            return
+    support_role = discord.utils.get(ctx.guild.roles, name="지원핑") or await ctx.guild.create_role(name="지원핑")
+    end_role = discord.utils.get(ctx.guild.roles, name="end") or await ctx.guild.create_role(name="end")
 
     try:
-        await member.add_roles(gender_role, support_role, end_role, reason=f"{ctx.author.name} 관리자의 인증 승인 완료")
-        await ctx.send(f"축하합니다 {member.mention}님! 인증이 성공적으로 완료되었어요!")
-
+        await member.add_roles(gender_role, support_role, end_role)
+        await ctx.send(f"축하합니다 {member.mention}님! 인증이 완료되었습니다.")
     except discord.Forbidden:
-        await ctx.send("❌ 봇의 역할 순위가 부여하려는 역할보다 낮아 역할을 줄 수 없습니다. 서버 설정에서 봇의 역할을 위로 올려주세요.")
-    except Exception as e:
-        await ctx.send(f"❌ 인증 처리 중 에러가 발생했습니다: `{e}`")
+        await ctx.send("❌ 봇의 서열이 낮아 역할을 부여하지 못했습니다.", delete_after=5)
 
-# !제재 @사용자 (사유) 명령어
 @bot.command(name="제재")
 @commands.has_permissions(moderate_members=True) 
 async def manual_punish(ctx, member: discord.Member, *, reason: str = "관리자 수동 제재"):
     try: await ctx.message.delete()
     except discord.Forbidden: pass
+    await punish_user(ctx.guild, member, reason, str(ctx.author.name))
 
-    await punish_user(ctx.guild, member, reason, ctx.author.mention)
-
-# !제재지우기 @사용자 명령어
 @bot.command(name="제재지우기")
 @commands.has_permissions(moderate_members=True)
 async def clear_punish(ctx, member: discord.Member):
@@ -276,14 +248,10 @@ async def clear_punish(ctx, member: discord.Member):
     if guild_id not in SERVER_CONFIG:
         return
 
-    log_channel_id = SERVER_CONFIG[guild_id]
-    log_channel = ctx.guild.get_channel(log_channel_id)
-    if not log_channel:
-        try: log_channel = await bot.fetch_channel(log_channel_id)
-        except Exception: log_channel = None
+    log_channel = ctx.guild.get_channel(SERVER_CONFIG[guild_id])
 
     try:
-        await member.edit(timed_out_until=None, reason="관리자가 제재 감면 및 해제")
+        await member.edit(timed_out_until=None, reason="관리자가 제재 해제")
 
         current_count = 0
         roles_to_remove = []
@@ -299,32 +267,26 @@ async def clear_punish(ctx, member: discord.Member):
             await member.remove_roles(*roles_to_remove)
 
         next_count = max(0, current_count - 1)
+        action_description = "대상자의 타임아웃 및 모든 전과 단계를 완전히 초기화했습니다."
 
-        action_description = ""
         if next_count > 0:
             new_role_name = f"전과 {next_count}범"
-            role = discord.utils.get(ctx.guild.roles, name=new_role_name)
-            if not role:
-                role = await ctx.guild.create_role(name=new_role_name, reason="전과 시스템 자동 생성")
+            role = discord.utils.get(ctx.guild.roles, name=new_role_name) or await ctx.guild.create_role(name=new_role_name)
             await member.add_roles(role)
-            action_description = f"대상자의 타임아웃을 해제하고 전과 단계를 한 단계 하향 조정했습니다. (**전과 {current_count}범** ➡️ **{new_role_name}**)"
-        else:
-            action_description = f"대상자의 타임아웃을 해제하고 누적되어 있던 전과 단계를 모두 초기화(0범)했습니다."
+            action_description = f"타임아웃 해제 후 전과 단계를 하향했습니다. (**전과 {current_count}범** ➡️ **{new_role_name}**)"
 
         if log_channel:
             embed = discord.Embed(title="🔓 유저 제재 감면 및 해제", color=discord.Color.green(), timestamp=discord.utils.utcnow())
             embed.add_field(name="👤 대상자", value=f"{member.mention} ({member.name})", inline=True)
-            embed.add_field(name="🔨 실행 관리자", value=ctx.author.mention, inline=True)
+            embed.add_field(name="🔨 실행 관리자", value=str(ctx.author.name), inline=True)
             embed.description = action_description
             await log_channel.send(embed=embed)
             
     except discord.Forbidden:
-        if log_channel:
-            await log_channel.send(f"❌ **해제 실패:** 봇의 역할 순위가 낮아 {member.mention}님의 제재를 풀지 못했습니다.")
+        if log_channel: await log_channel.send("❌ 봇의 서열이 낮아 제재 감면 명령을 거부당했습니다.")
     except Exception as e:
-        if log_channel:
-            await log_channel.send(f"❌ **제재 해제 중 시스템 에러 발생:** `{e}`")
+        if log_channel: await log_channel.send(f"❌ 시스템 에러: `{e}`")
 
-# ================= [ 봇 실행 ] =================
+# ================= [ 실행 ] =================
 keep_alive() 
 bot.run(os.getenv("DISCORD_TOKEN"))
