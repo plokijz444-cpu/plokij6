@@ -23,7 +23,8 @@ def keep_alive():
 SERVER_CONFIG = {
     1553762662868058164: 1554055050819670036,  # 서버 1 ID : 제재방 1 ID
     1529347274403086468: 1546457831631224843,  # 서버 2 ID : 제재방 2 ID
-    1543921157101854820: 1553219199084798054   # 서버 3 ID : 제재방 3 ID
+    1543921157101854820: 1553219199084798054,  # 서버 3 ID : 제재방 3 ID
+    1555119957623185419: 1555595932270198875   # 서버 4 ID : 제재방 4 ID
 }
 
 # 서버 1 전용 채널 ID 설정
@@ -202,7 +203,9 @@ async def on_message(message: discord.Message):
             try: await message.delete() 
             except discord.Forbidden: pass
             
-            detailed_reason = f"금지어 `[{word}]` 사용 검열\n**[적발된 문장 원본]**\n|| {original_sentence} ||"
+            detailed_reason = f"금지어 `[{word}]` 사용 검열
+**[적발된 문장 원본]**
+|| {original_sentence} ||"
             await punish_user(message.guild, message.author, detailed_reason, "시스템 자동 검열")
             return
 
