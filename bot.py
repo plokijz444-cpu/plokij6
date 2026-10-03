@@ -34,8 +34,6 @@ SERVER1_AUTH_CHANNEL_ID = 1554061009302585384
 SERVER1_JOIN_LOG_CHANNEL_ID = 1554077665739407360   
 SERVER1_LEAVE_LOG_CHANNEL_ID = 1554078156695142542  
 
-BANNED_WORDS = ["장애","애미","느금","너엄","너애미","너애비","느금마","느금빠","느개비","느그애비","애비","창녀","창년","보지","봊이","자지","섹스","섹x","정액"]
-
 intents = discord.Intents.default()
 intents.message_content = True  
 intents.members = True          
@@ -188,16 +186,6 @@ async def on_message(message: discord.Message):
     if message.content == "안녕":
         await message.channel.send(f"안녕하세요, {message.author.mention}님! 반가워요.")
         return
-
-    for word in BANNED_WORDS:
-        if word in message.content:
-            original_sentence = message.content
-            try: await message.delete() 
-            except discord.Forbidden: pass
-            
-            detailed_reason = f"금지어 `[{word}]` 사용 검열 | 적발된 문장 원본: || {original_sentence} ||"
-            await punish_user(message.guild, message.author, detailed_reason, "시스템 자동 검열")
-            return
 
 # ================= [ 관리자 명령어 로직 ] =================
 @bot.command(name="인증완료")
