@@ -24,8 +24,7 @@ def keep_alive():
 # ================= [ 디스코드 봇 설정 & 데이터 ] =================
 SERVER_CONFIG = {
     1553762662868058164: 1554055050819670036,  # 서버 1 ID : 제재방 1 ID
-    1529347274403086468: 1546457831631224843,  # 서버 2 ID : 제재방 2 ID
-    1543921157101854820: 1553219199084798054,  # 서버 3 ID : 제재방 3 ID
+    1529347274403086468: 1546457831631224843,  # 서버 2 ID : 제재방 2 ID (기존 데이터 유지)
     1555119957623185419: 1555617599528898690   # 서버 4 ID : 제재방 4 ID (추가됨)
 }
 
@@ -33,6 +32,12 @@ SERVER1_ID = 1553762662868058164
 SERVER1_AUTH_CHANNEL_ID = 1554061009302585384
 SERVER1_JOIN_LOG_CHANNEL_ID = 1554077665739407360   
 SERVER1_LEAVE_LOG_CHANNEL_ID = 1554078156695142542  
+
+# 서버 2 새로운 설정 값 추가
+SERVER2_ID = 1529347274403086468
+SERVER2_AUTH_CHANNEL_ID = 1558091070133370900
+SERVER2_JOIN_LOG_CHANNEL_ID = 1558096103147311224
+SERVER2_LEAVE_LOG_CHANNEL_ID = 1558096131534364692
 
 intents = discord.Intents.default()
 intents.message_content = True  
@@ -118,61 +123,111 @@ async def on_ready():
 
 @bot.event
 async def on_member_join(member: discord.Member):
-    if member.guild.id != SERVER1_ID:
-        return
+    # ----- 서버 1 처리 -----
+    if member.guild.id == SERVER1_ID:
+        auth_channel = member.guild.get_channel(SERVER1_AUTH_CHANNEL_ID)
+        if not auth_channel:
+            try: auth_channel = await bot.fetch_channel(SERVER1_AUTH_CHANNEL_ID)
+            except Exception: auth_channel = None
 
-    auth_channel = member.guild.get_channel(SERVER1_AUTH_CHANNEL_ID)
-    if not auth_channel:
-        try: auth_channel = await bot.fetch_channel(SERVER1_AUTH_CHANNEL_ID)
-        except Exception: auth_channel = None
+        if auth_channel:
+            welcome_msg = (
+                f"안녕하세요 {member.mention}님! 인증방에 닉/성별/참가경로/@관리자 멘션을 하시면 서버에 참가하실수 있어요. "
+                f"단, 인증양식이 다르다면 관리자가 서버에 참가를 시키지 않을수 있으니 조심하세요!"
+            )
+            await auth_channel.send(welcome_msg)
 
-    if auth_channel:
-        welcome_msg = (
-            f"안녕하세요 {member.mention}님! 인증방에 닉/성별/참가경로/@관리자 멘션을 하시면 서버에 참가하실수 있어요. "
-            f"단, 인증양식이 다르다면 관리자가 서버에 참가를 시키지 않을수 있으니 조심하세요!"
-        )
-        await auth_channel.send(welcome_msg)
+        join_log_channel = member.guild.get_channel(SERVER1_JOIN_LOG_CHANNEL_ID)
+        if not join_log_channel:
+            try: join_log_channel = await bot.fetch_channel(SERVER1_JOIN_LOG_CHANNEL_ID)
+            except Exception: join_log_channel = None
 
-    join_log_channel = member.guild.get_channel(SERVER1_JOIN_LOG_CHANNEL_ID)
-    if not join_log_channel:
-        try: join_log_channel = await bot.fetch_channel(SERVER1_JOIN_LOG_CHANNEL_ID)
-        except Exception: join_log_channel = None
-
-    if join_log_channel:
-        now = datetime.datetime.now().strftime('%Y년 %m월 %d일 %H시 %M분')
-        created_at = member.created_at.strftime('%Y년 %m월 %d일 %H시 %M분')
-        
-        embed = discord.Embed(title="📥 유저 서버 입장", color=discord.Color.green())
-        embed.add_field(name="👤 대상 유저", value=f"{member.mention} ({member.name})", inline=False)
-        embed.add_field(name="⏰ 입장 시간", value=now, inline=True)
-        embed.add_field(name="📅 계정 생성일", value=created_at, inline=True)
-        
-        if member.avatar: embed.set_image(url=member.avatar.url)
-        else: embed.set_image(url=member.default_avatar.url)
+        if join_log_channel:
+            now = datetime.datetime.now().strftime('%Y년 %m월 %d일 %H시 %M분')
+            created_at = member.created_at.strftime('%Y년 %m월 %d일 %H시 %M분')
             
-        await join_log_channel.send(embed=embed)
+            embed = discord.Embed(title="📥 유저 서버 입장", color=discord.Color.green())
+            embed.add_field(name="👤 대상 유저", value=f"{member.mention} ({member.name})", inline=False)
+            embed.add_field(name="⏰ 입장 시간", value=now, inline=True)
+            embed.add_field(name="📅 계정 생성일", value=created_at, inline=True)
+            
+            if member.avatar: embed.set_image(url=member.avatar.url)
+            else: embed.set_image(url=member.default_avatar.url)
+                
+            await join_log_channel.send(embed=embed)
+
+    # ----- 서버 2 처리 -----
+    elif member.guild.id == SERVER2_ID:
+        auth_channel = member.guild.get_channel(SERVER2_AUTH_CHANNEL_ID)
+        if not auth_channel:
+            try: auth_channel = await bot.fetch_channel(SERVER2_AUTH_CHANNEL_ID)
+            except Exception: auth_channel = None
+
+        if auth_channel:
+            embed = discord.Embed(
+                description=f"안녕하세요 {member.mention}님! 닉/성별/관리자멘션 양식으로 인증을 하여 서버에 참가하세요!",
+                color=discord.Color.blue()
+            )
+            if member.avatar: embed.set_image(url=member.avatar.url)
+            else: embed.set_image(url=member.default_avatar.url)
+            await auth_channel.send(embed=embed)
+
+        join_log_channel = member.guild.get_channel(SERVER2_JOIN_LOG_CHANNEL_ID)
+        if not join_log_channel:
+            try: join_log_channel = await bot.fetch_channel(SERVER2_JOIN_LOG_CHANNEL_ID)
+            except Exception: join_log_channel = None
+
+        if join_log_channel:
+            now = datetime.datetime.now().strftime('%Y년 %m월 %d일 %H시 %M분')
+            created_at = member.created_at.strftime('%Y년 %m월 %d일 %H시 %M분')
+            
+            embed = discord.Embed(title="📥 유저 서버 입장", color=discord.Color.green())
+            embed.add_field(name="👤 대상 유저", value=f"{member.mention} ({member.name})", inline=False)
+            embed.add_field(name="⏰ 입장 시간", value=now, inline=True)
+            embed.add_field(name="📅 계정 생성일", value=created_at, inline=True)
+            
+            if member.avatar: embed.set_image(url=member.avatar.url)
+            else: embed.set_image(url=member.default_avatar.url)
+                
+            await join_log_channel.send(content=f"안녕하세요 {member.mention}님! 저희 서버에 오신것을 환영해요", embed=embed)
 
 @bot.event
 async def on_member_remove(member: discord.Member):
-    if member.guild.id != SERVER1_ID:
-        return
+    # ----- 서버 1 처리 -----
+    if member.guild.id == SERVER1_ID:
+        leave_log_channel = member.guild.get_channel(SERVER1_LEAVE_LOG_CHANNEL_ID)
+        if not leave_log_channel:
+            try: leave_log_channel = await bot.fetch_channel(SERVER1_LEAVE_LOG_CHANNEL_ID)
+            except Exception: leave_log_channel = None
 
-    leave_log_channel = member.guild.get_channel(SERVER1_LEAVE_LOG_CHANNEL_ID)
-    if not leave_log_channel:
-        try: leave_log_channel = await bot.fetch_channel(SERVER1_LEAVE_LOG_CHANNEL_ID)
-        except Exception: leave_log_channel = None
-
-    if leave_log_channel:
-        now = datetime.datetime.now().strftime('%Y년 %m월 %d일 %H시 %M분')
-        
-        embed = discord.Embed(title="📤 유저 서버 퇴장", color=discord.Color.red())
-        embed.add_field(name="👤 대상 유저", value=f"{member.name} (ID: {member.id})", inline=False)
-        embed.add_field(name="⏰ 퇴장 시간", value=now, inline=False)
-        
-        if member.avatar: embed.set_image(url=member.avatar.url)
-        else: embed.set_image(url=member.default_avatar.url)
+        if leave_log_channel:
+            now = datetime.datetime.now().strftime('%Y년 %m월 %d일 %H시 %M분')
             
-        await leave_log_channel.send(embed=embed)
+            embed = discord.Embed(title="📤 유저 서버 퇴장", color=discord.Color.red())
+            embed.add_field(name="👤 대상 유저", value=f"{member.name} (ID: {member.id})", inline=False)
+            embed.add_field(name="⏰ 퇴장 시간", value=now, inline=False)
+            
+            if member.avatar: embed.set_image(url=member.avatar.url)
+            else: embed.set_image(url=member.default_avatar.url)
+                
+            await leave_log_channel.send(embed=embed)
+
+    # ----- 서버 2 처리 -----
+    elif member.guild.id == SERVER2_ID:
+        leave_log_channel = member.guild.get_channel(SERVER2_LEAVE_LOG_CHANNEL_ID)
+        if not leave_log_channel:
+            try: leave_log_channel = await bot.fetch_channel(SERVER2_LEAVE_LOG_CHANNEL_ID)
+            except Exception: leave_log_channel = None
+
+        if leave_log_channel:
+            embed = discord.Embed(title="📤 유저 서버 퇴장", color=discord.Color.red())
+            embed.description = f"다음에 만날날이 오길빌게요... 
+대상 유저: **{member.name}**"
+            
+            if member.avatar: embed.set_image(url=member.avatar.url)
+            else: embed.set_image(url=member.default_avatar.url)
+                
+            await leave_log_channel.send(embed=embed)
 
 @bot.event
 async def on_message(message: discord.Message):
@@ -194,8 +249,7 @@ async def approve_auth(ctx, member: discord.Member, gender_input: str):
     try: await ctx.message.delete()
     except discord.Forbidden: pass
 
-    if ctx.channel.id != SERVER1_AUTH_CHANNEL_ID:
-        return
+    # 모든 채널에서 사용할 수 있도록 채널 ID 검증(ctx.channel.id != SERVER1_AUTH_CHANNEL_ID) 구문 제거
 
     gender_role = None
     if gender_input.startswith("<@&") and gender_input.endswith(">"):
@@ -208,12 +262,23 @@ async def approve_auth(ctx, member: discord.Member, gender_input: str):
         await ctx.send(f"❌ 역할을 찾을 수 없습니다: `{gender_input}`", delete_after=5)
         return
 
-    support_role = discord.utils.get(ctx.guild.roles, name="지원핑") or await ctx.guild.create_role(name="지원핑")
-    end_role = discord.utils.get(ctx.guild.roles, name="end") or await ctx.guild.create_role(name="end")
-
     try:
-        await member.add_roles(gender_role, support_role, end_role)
-        await ctx.send(f"축하합니다 {member.mention}님! 인증이 완료되었습니다.")
+        if ctx.guild.id == SERVER2_ID:
+            # 서버 2 전용 역할 처리: '【✅】-『멤버』' 부여
+            member_role = discord.utils.get(ctx.guild.roles, name="【✅】-『멤버』")
+            if not member_role:
+                member_role = await ctx.guild.create_role(name="【✅】-『멤버』", reason="서버2 기본 멤버 역할 자동 생성")
+            
+            await member.add_roles(gender_role, member_role)
+            await ctx.send(f"축하합니다 {member.mention}님! 인증이 완료되었습니다.")
+        else:
+            # 기존 서버 처리 (서버 1 등)
+            support_role = discord.utils.get(ctx.guild.roles, name="지원핑") or await ctx.guild.create_role(name="지원핑")
+            end_role = discord.utils.get(ctx.guild.roles, name="end") or await ctx.guild.create_role(name="end")
+            
+            await member.add_roles(gender_role, support_role, end_role)
+            await ctx.send(f"축하합니다 {member.mention}님! 인증이 완료되었습니다.")
+            
     except discord.Forbidden:
         await ctx.send("❌ 봇의 서열이 낮아 역할을 부여하지 못했습니다.", delete_after=5)
 
