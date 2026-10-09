@@ -4,6 +4,7 @@ import datetime
 from flask import Flask
 from threading import Thread
 import os
+import typing
 
 # ================= [ Render 24시간 가동을 위한 웹서버 ] =================
 app = Flask('')
@@ -80,7 +81,7 @@ async def punish_user(guild: discord.Guild, member: discord.Member, reason: str,
                 await log_channel.send(embed=embed)
             return
 
-        # 2. 타임아웃 처리 (가장 신뢰도가 높은 디스코드 자체 기능 우선 수행)
+        # 2. 타임아웃 처리
         punish_days = min(current_count, 28)
         duration = datetime.timedelta(days=punish_days)
         target_time = discord.utils.utcnow() + duration
@@ -122,7 +123,7 @@ async def on_ready():
 
 @bot.event
 async def on_member_join(member: discord.Member):
-    # ------ [ 서버 1 입장 시스템 ] ------
+    # Server 1
     if member.guild.id == SERVER1_ID:
         auth_channel = member.guild.get_channel(SERVER1_AUTH_CHANNEL_ID)
         if not auth_channel:
@@ -155,7 +156,7 @@ async def on_member_join(member: discord.Member):
                 
             await join_log_channel.send(embed=embed)
 
-    # ------ [ 서버 2 입장 시스템 ] ------
+    # Server 2
     elif member.guild.id == SERVER2_ID:
         auth_channel = member.guild.get_channel(SERVER2_AUTH_CHANNEL_ID)
         if not auth_channel:
@@ -164,6 +165,7 @@ async def on_member_join(member: discord.Member):
 
         if auth_channel:
             embed = discord.Embed(
+                title="👋 환영합니다!",
                 description=f"안녕하세요 {member.mention}님! 닉/성별/관리자멘션 양식으로 인증을 하여 서버에 참가하세요!",
                 color=discord.Color.blue()
             )
@@ -192,7 +194,7 @@ async def on_member_join(member: discord.Member):
 
 @bot.event
 async def on_member_remove(member: discord.Member):
-    # ------ [ 서버 1 퇴장 시스템 ] ------
+    # Server 1
     if member.guild.id == SERVER1_ID:
         leave_log_channel = member.guild.get_channel(SERVER1_LEAVE_LOG_CHANNEL_ID)
         if not leave_log_channel:
@@ -211,7 +213,7 @@ async def on_member_remove(member: discord.Member):
                 
             await leave_log_channel.send(embed=embed)
 
-    # ------ [ 서버 2 퇴장 시스템 ] ------
+    # Server 2
     elif member.guild.id == SERVER2_ID:
         leave_log_channel = member.guild.get_channel(SERVER2_LEAVE_LOG_CHANNEL_ID)
         if not leave_log_channel:
@@ -219,12 +221,9 @@ async def on_member_remove(member: discord.Member):
             except Exception: leave_log_channel = None
 
         if leave_log_channel:
-            embed = discord.Embed(
-                title="📤 유저 서버 퇴장",
-                description=f"다음에 만날날이 오길빌게요...",
-                color=discord.Color.red()
-            )
-            embed.add_field(name="👤 대상 유저", value=f"{member.name} (ID: {member.id})", inline=False)
+            embed = discord.Embed(title="📤 유저 서버 퇴장", color=discord.Color.red())
+            embed.description = "다음에 만날날이 오길빌게요..."
+            embed.add_field(name="👤 퇴장 유저", value=f"{member.name} (ID: {member.id})", inline=False)
             
             if member.avatar: embed.set_image(url=member.avatar.url)
             else: embed.set_image(url=member.default_avatar.url)
@@ -247,38 +246,99 @@ async def on_message(message: discord.Message):
 # ================= [ 관리자 명령어 로직 ] =================
 @bot.command(name="인증완료")
 @commands.has_permissions(manage_roles=True)
-async def approve_auth(ctx, member: discord.Member, gender_input: str):
+async def approve_auth(ctx, target: typing.Union[discord.Member, str], gender_input: str):
     try: await ctx.message.delete()
     except discord.Forbidden: pass
 
-    gender_role = None
-    if gender_input.startswith("<@&") and gender_input.endswith(">"):
-        role_id = int(gender_input.replace("<@&", "").replace(">", ""))
-        gender_role = ctx.guild.get_role(role_id)
-    else:
-        gender_role = discord.utils.get(ctx.guild.roles, name=gender_input)
+    guild = ctx.guild
 
-    if not gender_role:
-        await ctx.send(f"❌ 역할을 찾을 수 없습니다: `{gender_input}`", delete_after=5)
+    # 1. 대상 결정 및 채널 결정 분기
+    if guild.id == SERVER1_ID:
+        target_channel_id = SERVER1_AUTH_CHANNEL_ID
+    elif guild.id == SERVER2_ID:
+        target_channel_id = SERVER2_AUTH_CHANNEL_ID
+    else:
+        target_channel_id = ctx.channel.id
+
+    target_channel = guild.get_channel(target_channel_id)
+    if not target_channel:
+        target_channel = ctx.channel
+
+    # 2. @everyone 전체 인증 처리 (서버 2 전용)
+    if isinstance(target, str) and target in ["@everyone", "everyone"]:
+        if guild.id != SERVER2_ID:
+            await ctx.send("❌ 전체 인증 명령어는 서버 2에서만 사용 가능합니다.", delete_after=5)
+            return
+
+        # 성별 역할 이름 매핑
+        if "남" in gender_input:
+            gender_role_name = "【🟦】-『남자』"
+        elif "여" in gender_input:
+            gender_role_name = "【🟥】-『여자』"
+        else:
+            gender_role_name = gender_input
+
+        # 역할 조회 및 생성
+        gender_role = discord.utils.get(guild.roles, name=gender_role_name) or await guild.create_role(name=gender_role_name)
+        member_role = discord.utils.get(guild.roles, name="【✅】-『멤버』") or await guild.create_role(name="【✅】-『멤버』")
+
+        # 비동기 전체 지급 알림 및 처리 (대규모 인원 고려하여 안내 후 순차적 백그라운드 처리 권장)
+        await target_channel.send(f"📢 모든 서버 멤버에게 **{member_role.name}** 및 **{gender_role.name}** 역할을 순차적으로 지급합니다. (전체 인증 프로세스 시작)")
+        
+        # 실제 백그라운드 순차 지급 진행
+        for member in guild.members:
+            if not member.bot:
+                try:
+                    await member.add_roles(member_role, gender_role)
+                except discord.Forbidden:
+                    continue
         return
 
-    roles_to_add = [gender_role]
+    # 3. 개별 유저 인증 처리
+    if not isinstance(target, discord.Member):
+        await ctx.send("❌ 올바른 유저를 멘션하거나 @everyone을 입력해 주세요.", delete_after=5)
+        return
 
-    # 서버 별 차등 역할 지급 로직
-    if ctx.guild.id == SERVER1_ID:
-        support_role = discord.utils.get(ctx.guild.roles, name="지원핑") or await ctx.guild.create_role(name="지원핑")
-        end_role = discord.utils.get(ctx.guild.roles, name="end") or await ctx.guild.create_role(name="end")
-        roles_to_add.extend([support_role, end_role])
-        
-    elif ctx.guild.id == SERVER2_ID:
-        member_role = discord.utils.get(ctx.guild.roles, name="【✅】-『멤버』") or await ctx.guild.create_role(name="【✅】-『멤버』")
-        roles_to_add.append(member_role)
+    member = target
 
-    try:
-        await member.add_roles(*roles_to_add)
-        await ctx.send(f"축하합니다 {member.mention}님! 인증이 완료되었습니다.")
-    except discord.Forbidden:
-        await ctx.send("❌ 봇의 서열이 낮아 역할을 부여하지 못했습니다.", delete_after=5)
+    # 서버별 성별 및 지급 역할 결정
+    if guild.id == SERVER2_ID:
+        if "남" in gender_input:
+            gender_role_name = "【🟦】-『남자』"
+        elif "여" in gender_input:
+            gender_role_name = "【🟥】-『여자』"
+        else:
+            gender_role_name = gender_input
+
+        gender_role = discord.utils.get(guild.roles, name=gender_role_name) or await guild.create_role(name=gender_role_name)
+        member_role = discord.utils.get(guild.roles, name="【✅】-『멤버』") or await guild.create_role(name="【✅】-『멤버』")
+
+        try:
+            await member.add_roles(gender_role, member_role)
+            await target_channel.send(f"🎉 축하합니다 {member.mention}님! 인증이 완료되었습니다.")
+        except discord.Forbidden:
+            await ctx.send("❌ 봇의 서열이 낮아 역할을 부여하지 못했습니다.", delete_after=5)
+
+    else:
+        # 기존 서버 1 및 기타 서버 로직 유지
+        gender_role = None
+        if gender_input.startswith("<@&") and gender_input.endswith(">"):
+            role_id = int(gender_input.replace("<@&", "").replace(">", ""))
+            gender_role = guild.get_role(role_id)
+        else:
+            gender_role = discord.utils.get(guild.roles, name=gender_input)
+
+        if not gender_role:
+            gender_role = await guild.create_role(name=gender_input)
+
+        support_role = discord.utils.get(guild.roles, name="지원핑") or await guild.create_role(name="지원핑")
+        end_role = discord.utils.get(guild.roles, name="end") or await guild.create_role(name="end")
+
+        try:
+            await member.add_roles(gender_role, support_role, end_role)
+            await target_channel.send(f"🎉 축하합니다 {member.mention}님! 인증이 완료되었습니다.")
+        except discord.Forbidden:
+            await ctx.send("❌ 봇의 서열이 낮아 역할을 부여하지 못했습니다.", delete_after=5)
 
 @bot.command(name="제재")
 @commands.has_permissions(moderate_members=True) 
@@ -320,7 +380,7 @@ async def clear_punish(ctx, member: discord.Member):
 
         if next_count > 0:
             new_role_name = f"전과 {next_count}범"
-            role = discord.utils.get(ctx.guild.roles, name=new_role_name) or await ctx.guild.create_role(name=new_role_name)
+            role = discord.utils.get(ctx.guild.roles, name=new_role_name) or await guild.create_role(name=new_role_name)
             await member.add_roles(role)
             action_description = f"타임아웃 해제 후 전과 단계를 하향했습니다. (**전과 {current_count}범** ➡️ **{new_role_name}**)"
 
