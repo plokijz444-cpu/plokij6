@@ -179,9 +179,9 @@ async def on_member_join(member: discord.Member):
     if auth_channel_id and auth_form:
         auth_channel = member.guild.get_channel(auth_channel_id) or await bot.fetch_channel(auth_channel_id)
         if auth_channel:
-            formatted_form = auth_form.replace("\\n", "\n").replace("\n", "
-")
-            await auth_channel.send(f"👋 {member.mention}님, 서버에 오신 것을 환영합니다!\n{formatted_form}")
+            converted_form = auth_form.replace("\\n", "\n").replace("\n", "\n")
+            welcome_text = f"👋 {member.mention}님, 서버에 오신 것을 환영합니다!\n{converted_form}"
+            await auth_channel.send(welcome_text)
 
     if join_log_id:
         join_log_channel = member.guild.get_channel(join_log_id) or await bot.fetch_channel(join_log_id)
@@ -317,18 +317,18 @@ async def remove_leave_log(interaction: discord.Interaction):
 @commands.has_permissions(administrator=True)
 async def set_auth_role(interaction: discord.Interaction, 역할: discord.Role):
     guild_id = interaction.guild.id
-    if guild_id not in GUILD_SETTINGS:
+    if guild_id not in GUILD_SETTINGS: 
         GUILD_SETTINGS[guild_id] = {}
     
     if "auth_role_ids" not in GUILD_SETTINGS[guild_id]:
         GUILD_SETTINGS[guild_id]["auth_role_ids"] = []
-
+        
     if 역할.id not in GUILD_SETTINGS[guild_id]["auth_role_ids"]:
         GUILD_SETTINGS[guild_id]["auth_role_ids"].append(역할.id)
         save_settings(GUILD_SETTINGS)
         await interaction.response.send_message(f"✅ 기본 마스터 역할 목록에 **{역할.name}**이(가) 추가되었습니다.", ephemeral=True)
     else:
-        await interaction.response.send_message(f"⚠️ {역할.name}은(는) 이미 기본 역할 목록에 등록되어 있습니다.", ephemeral=True)
+        await interaction.response.send_message(f"⚠️ **{역할.name}**은(는) 이미 기본 역할 목록에 등록되어 있습니다.", ephemeral=True)
 
 @bot.tree.command(name="인증지급리셋", description="등록되어 있던 모든 기본 마스터 역할 목록을 초기화합니다. (관리자 전용)")
 @commands.has_permissions(administrator=True)
@@ -342,7 +342,7 @@ async def reset_auth_roles(interaction: discord.Interaction):
         await interaction.response.send_message("❌ 등록된 역할 목록이 존재하지 않습니다.", ephemeral=True)
 
 @bot.tree.command(name="인증양식", description="유저가 입장할 때 자동으로 보낼 가이드 안내 양식 문구를 등록합니다. (관리자 전용)")
-@app_commands.describe(양식="인증방에 출력할 문구를 작성하세요. (줄바꿈은 \\n 문자를 사용하세요)")
+@app_commands.describe(양식="인증방에 출력할 문구를 작성하세요. (줄바꿈은 \n 문자를 사용하세요)")
 @commands.has_permissions(administrator=True)
 async def set_auth_form(interaction: discord.Interaction, 양식: str):
     guild_id = interaction.guild.id
@@ -354,7 +354,7 @@ async def set_auth_form(interaction: discord.Interaction, 양식: str):
 # ================= [ 🛠️ 유저 관리 및 가이드 명령어 파트 ] =================
 
 @bot.tree.command(name="인증완료", description="대상 대기자 유저에게 기본 역할과 성별/특수 역할을 목록에서 직접 선택해 원격 지급합니다.")
-@app_commands.describe(유저="인증을 승인할 유저를 멤버 목록에서 선택하세요.", 추가역할="성별(남자/여자)이나 추가로 줄 특수 역할을 역할 목록에서 선택하세요. (선택사항)")
+@app_commands.describe(유저="인증을 승인할 유저를 선택하세요.", 추가역할="성별(남자/여자)이나 추가로 얹어줄 특수 역할을 목록에서 선택하세요. (선택사항)")
 @commands.has_permissions(manage_roles=True)
 async def approve_user(interaction: discord.Interaction, 유저: discord.Member, 추가역할: discord.Role = None):
     await interaction.response.defer(ephemeral=True)
@@ -369,7 +369,7 @@ async def approve_user(interaction: discord.Interaction, 유저: discord.Member,
         return
 
     roles_to_add = []
-
+    
     for r_id in base_role_ids:
         role = guild.get_role(r_id)
         if role:
@@ -408,7 +408,7 @@ async def manual_punish_slash(interaction: discord.Interaction, member: discord.
 async def clear_punish_slash(interaction: discord.Interaction, member: discord.Member):
     await interaction.response.defer(ephemeral=True)
     guild = interaction.guild
-    
+
     if guild.id not in GUILD_SETTINGS or "punish_log_channel" not in GUILD_SETTINGS[guild.id]:
         await interaction.followup.send("❌ 시스템 설정에 제재 로그방 정보가 없습니다. `/제재로그설정`을 먼저 실행하세요.")
         return
@@ -486,7 +486,7 @@ async def send_system_guide(interaction: discord.Interaction):
     embed.add_field(name="⚙️ 시스템 통합 명령어 구성표", value=guide_text, inline=False)
     embed.add_field(name="🚨 채널/역할 설정 누락 시 생기는 관리자 불이익", value=penalty_text, inline=False)
     embed.set_footer(text="안전하고 청정한 서버 환경을 구축합니다 • Powered by NattoBot")
-
+    
     await interaction.followup.send(embed=embed)
 
 # ================= [ 실행 ] =================
