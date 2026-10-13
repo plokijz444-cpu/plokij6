@@ -154,7 +154,7 @@ async def on_guild_join(guild: discord.Guild):
                     value=(
                         "• `/인증방설정 채널:[#채널]`\n"
                         "• `/제재로그설정 채널:[#채널]`\n"
-                        "• `/인증지급 역할:[@역할]`\n"
+                        "• `/인증지급 역할:[@역할]` (여러 개 등록 가능)\n"
                         "• `/인증양식 양식:[텍스트]`\n\n"
                         "자세한 사용법은 채팅창에 **`/가이드`**를 입력하여 확인하세요!"
                     ),
@@ -179,7 +179,8 @@ async def on_member_join(member: discord.Member):
     if auth_channel_id and auth_form:
         auth_channel = member.guild.get_channel(auth_channel_id) or await bot.fetch_channel(auth_channel_id)
         if auth_channel:
-            formatted_form = auth_form.replace("\\n", "\n")
+            formatted_form = auth_form.replace("\\n", "\n").replace("\n", "
+")
             await auth_channel.send(f"👋 {member.mention}님, 서버에 오신 것을 환영합니다!\n{formatted_form}")
 
     if join_log_id:
@@ -311,18 +312,37 @@ async def remove_leave_log(interaction: discord.Interaction):
     else:
         await interaction.response.send_message("❌ 설정된 퇴장 로그 채널이 없습니다.", ephemeral=True)
 
-@bot.tree.command(name="인증지급", description="인증완료 명령어 처리 시 지급할 마스터 역할을 등록합니다. (관리자 전용)")
-@app_commands.describe(역할="지급할 디스코드 역할을 선택하세요.")
+@bot.tree.command(name="인증지급", description="인증완료 시 지급할 기본 마스터 역할들을 누적 등록합니다. (관리자 전용)")
+@app_commands.describe(역할="지급할 기본 역할을 선택하세요. 여러 번 실행 시 다중 등록됩니다.")
 @commands.has_permissions(administrator=True)
 async def set_auth_role(interaction: discord.Interaction, 역할: discord.Role):
     guild_id = interaction.guild.id
-    if guild_id not in GUILD_SETTINGS: GUILD_SETTINGS[guild_id] = {}
-    GUILD_SETTINGS[guild_id]["auth_role_id"] = 역할.id
-    save_settings(GUILD_SETTINGS)
-    await interaction.response.send_message(f"✅ 인증 완료 시 지급할 마스터 역할이 **{역할.name}**으로 등록되었습니다.", ephemeral=True)
+    if guild_id not in GUILD_SETTINGS:
+        GUILD_SETTINGS[guild_id] = {}
+    
+    if "auth_role_ids" not in GUILD_SETTINGS[guild_id]:
+        GUILD_SETTINGS[guild_id]["auth_role_ids"] = []
+
+    if 역할.id not in GUILD_SETTINGS[guild_id]["auth_role_ids"]:
+        GUILD_SETTINGS[guild_id]["auth_role_ids"].append(역할.id)
+        save_settings(GUILD_SETTINGS)
+        await interaction.response.send_message(f"✅ 기본 마스터 역할 목록에 **{역할.name}**이(가) 추가되었습니다.", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"⚠️ {역할.name}은(는) 이미 기본 역할 목록에 등록되어 있습니다.", ephemeral=True)
+
+@bot.tree.command(name="인증지급리셋", description="등록되어 있던 모든 기본 마스터 역할 목록을 초기화합니다. (관리자 전용)")
+@commands.has_permissions(administrator=True)
+async def reset_auth_roles(interaction: discord.Interaction):
+    guild_id = interaction.guild.id
+    if guild_id in GUILD_SETTINGS and "auth_role_ids" in GUILD_SETTINGS[guild_id]:
+        GUILD_SETTINGS[guild_id]["auth_role_ids"] = []
+        save_settings(GUILD_SETTINGS)
+        await interaction.response.send_message("🗑️ 등록된 모든 기본 마스터 역할 리스트가 청소되었습니다.", ephemeral=True)
+    else:
+        await interaction.response.send_message("❌ 등록된 역할 목록이 존재하지 않습니다.", ephemeral=True)
 
 @bot.tree.command(name="인증양식", description="유저가 입장할 때 자동으로 보낼 가이드 안내 양식 문구를 등록합니다. (관리자 전용)")
-@app_commands.describe(양식="인증방에 출력할 문구를 작성하세요. (줄바꿈은 \n 문자를 섞어 쓰세요)")
+@app_commands.describe(양식="인증방에 출력할 문구를 작성하세요. (줄바꿈은 \\n 문자를 사용하세요)")
 @commands.has_permissions(administrator=True)
 async def set_auth_form(interaction: discord.Interaction, 양식: str):
     guild_id = interaction.guild.id
@@ -333,47 +353,57 @@ async def set_auth_form(interaction: discord.Interaction, 양식: str):
 
 # ================= [ 🛠️ 유저 관리 및 가이드 명령어 파트 ] =================
 
-@bot.tree.command(name="인증완료", description="대상 대기자 유저에게 미리 설정해 둔 마스터 역할을 원격 지급합니다.")
-@app_commands.describe(유저="인증을 통과시킬 대상 멤버를 선택하세요.")
+@bot.tree.command(name="인증완료", description="대상 대기자 유저에게 기본 역할과 성별/특수 역할을 목록에서 직접 선택해 원격 지급합니다.")
+@app_commands.describe(유저="인증을 승인할 유저를 멤버 목록에서 선택하세요.", 추가역할="성별(남자/여자)이나 추가로 줄 특수 역할을 역할 목록에서 선택하세요. (선택사항)")
 @commands.has_permissions(manage_roles=True)
-async def approve_user(interaction: discord.Interaction, 유저: discord.Member):
+async def approve_user(interaction: discord.Interaction, 유저: discord.Member, 추가역할: discord.Role = None):
     await interaction.response.defer(ephemeral=True)
     guild = interaction.guild
 
     settings = GUILD_SETTINGS.get(guild.id, {})
-    role_id = settings.get("auth_role_id")
+    base_role_ids = settings.get("auth_role_ids", [])
     auth_channel_id = settings.get("auth_channel")
 
-    if not role_id:
-        await interaction.followup.send("❌ 서버에 등록된 인증지급 역할이 없습니다. `/인증지급`을 통해 역할을 먼저 가르쳐주세요.")
+    if not base_role_ids and not 추가역할:
+        await interaction.followup.send("❌ 지급할 기본 역할이나 추가역할이 없습니다. 설정을 먼저 진행해 주세요.")
         return
 
-    target_role = guild.get_role(role_id)
-    if not target_role:
-        await interaction.followup.send("❌ 지정된 역할이 서버에 존재하지 않습니다. 역할을 재생성하거나 다시 지정해 주세요.")
+    roles_to_add = []
+
+    for r_id in base_role_ids:
+        role = guild.get_role(r_id)
+        if role:
+            roles_to_add.append(role)
+
+    if 추가역할:
+        roles_to_add.append(추가역할)
+
+    if not roles_to_add:
+        await interaction.followup.send("❌ 지정된 역할들이 현재 이 서버에 존재하지 않습니다.")
         return
 
     try:
-        await 유저.add_roles(target_role, reason="관리자 수동 인증 완료 승인")
+        await 유저.add_roles(*roles_to_add, reason="관리자 수동 인증 완료 승인")
         
         target_channel = guild.get_channel(auth_channel_id) if auth_channel_id else interaction.channel
         if target_channel:
-            await target_channel.send(f"🎉 축하합니다 {유저.mention}님! 서류 인증이 승인되어 멤버 자격이 활성화되었습니다.")
+            roles_text = ", ".join([f"**{r.name}**" for r in roles_to_add])
+            await target_channel.send(f"🎉 축하합니다 {유저.mention}님! 서류 인증이 승인되어 멤버 역할({roles_text}) 자격이 활성화되었습니다.")
         
-        await interaction.followup.send(f"✅ {유저.name}님에게 성공적으로 역할을 지급하고 승인했습니다.")
+        await interaction.followup.send(f"✅ {유저.name}님에게 성공적으로 {len(roles_to_add)}개의 역할을 지급하고 승인했습니다.")
     except discord.Forbidden:
         await interaction.followup.send("❌ 봇의 서열(역할 순위)이 타겟 유저 또는 지급 역할보다 낮아 처리에 실패했습니다.")
 
-@bot.tree.command(name="제재", description="유저에게 관리자 수동 제재 및 전과 단계를 누적합니다.")
-@app_commands.describe(member="제재할 대상 유저를 선택하세요.", reason="제재 사유를 입력하세요.")
+@bot.tree.command(name="제재", description="멤버 목록에서 유저를 정확히 지정해 수동 제재 및 전과 단계를 누적합니다.")
+@app_commands.describe(member="제재 대상 멤버를 목록에서 검색하여 선택하세요.", reason="제재 사유를 입력하세요.")
 @commands.has_permissions(moderate_members=True)
 async def manual_punish_slash(interaction: discord.Interaction, member: discord.Member, reason: str = "관리자 수동 제재"):
     await interaction.response.defer(ephemeral=True)
     await punish_user(interaction.guild, member, reason, str(interaction.user.name))
     await interaction.followup.send(f"⚠️ {member.name} 유저에게 즉각적인 제재 및 전과 패널티를 부여했습니다.")
 
-@bot.tree.command(name="제재지우기", description="대상 유저의 타임아웃 패널티를 해제하고 전과 단계를 1범 감면합니다.")
-@app_commands.describe(member="제재를 복구하거나 감면할 대상을 선택하세요.")
+@bot.tree.command(name="제재지우기", description="멤버 목록에서 유저를 선택해 타임아웃을 풀고 전과 단계를 1범 감면합니다.")
+@app_commands.describe(member="제재 복구 대상 멤버를 목록에서 검색하여 선택하세요.")
 @commands.has_permissions(moderate_members=True)
 async def clear_punish_slash(interaction: discord.Interaction, member: discord.Member):
     await interaction.response.defer(ephemeral=True)
@@ -388,7 +418,6 @@ async def clear_punish_slash(interaction: discord.Interaction, member: discord.M
 
     try:
         await member.edit(timed_out_until=None, reason="관리자가 제재 스택 감면")
-
         current_count = 0
         roles_to_remove = []
         for r in member.roles:
@@ -427,17 +456,18 @@ async def clear_punish_slash(interaction: discord.Interaction, member: discord.M
 @bot.tree.command(name="가이드", description="보안 시스템 각 커맨드 사용법과 세팅 누락 시 생기는 불이익을 확인합니다.")
 async def send_system_guide(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=False)
-    
+
     guide_text = (
-        "• **/제재로그설정 `[#채널]`** : 유저 제재 및 전과 내역이 기록될 전용 로그 채널을 바인딩합니다.\n"
+        "• **/제재로그설정 `[#채널]`** : 유저 제재 및 전과 내역이 기록될 채널을 지정합니다.\n"
         "• **/제재로그제거** : 시스템에 연결된 제재 채널 데이터를 완전 파기합니다.\n"
         "• **/인증방설정 `[#채널]`** : 가입자가 최초 진입 시 인증 서식을 송출해 줄 타겟 채널을 셋업합니다.\n"
         "• **/인증방제거** : 지정된 인증 채널 설정을 초기화합니다.\n"
         "• **/입장로그설정 / /퇴장로그설정** : 입퇴장 유저 추적 데이터를 전송받을 로그 채널을 연동합니다.\n"
         "• **/입장로그제거 / /퇴장로그제거** : 바인딩된 입퇴장 방 정보를 테이블에서 삭제합니다.\n"
-        "• **/인증지급 `[@역할]`** : 승인 완료 시 지급할 마스터 역할을 ID 기반으로 영구 지정합니다.\n"
+        "• **/인증지급 `[@역할]`** : 승인 완료 시 줄 기본 역할들을 등록합니다. (여러 번 입력 시 누적 추가)\n"
+        "• **/인증지급리셋** : 등록되어 있던 모든 기본 마스터 역할 목록을 비웁니다.\n"
         "• **/인증양식 `[문구]`** : 신입 멤버 입장 즉시 안내할 질문지 양식을 저장합니다. (`\\n`으로 줄바꿈 가능)\n"
-        "• **/인증완료 `[@유저]`** : 대상 유저에게 사전 지정된 마스터 역할을 추적하여 즉시 일괄 부여합니다."
+        "• **/인증완료 `[@유저]` `[@추가역할]`** : 대상 유저에게 기본 역할들과 선택한 성별/특수 역할을 함께 지급합니다."
     )
 
     penalty_text = (
