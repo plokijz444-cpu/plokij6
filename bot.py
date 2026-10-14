@@ -222,13 +222,48 @@ async def on_member_remove(member: discord.Member):
             embed.set_thumbnail(url=avatar_url)
             await leave_log_channel.send(embed=embed)
 
+# ================= [ 자동 제재 및 검열 언어 감지 로직 ] =================
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot or not message.guild:
         return
+
+    guild_id = message.guild.id
+    settings = GUILD_SETTINGS.get(guild_id, {})
+    
+    # 1. 자동 제재 언어 검사
+    auto_ban_words = settings.get("auto_ban_words", [])
+    for word in auto_ban_words:
+        if word in message.content:
+            try:
+                # 메시지 즉시 삭제
+                await message.delete()
+            except discord.Forbidden:
+                pass
+            
+            # 클릭하면 보이는 스포일러 메시지 형식 복사
+            spoiler_content = f"||{message.content}||"
+            reason = f"자동 제재 대상 단어 포함: '{word}'\n**해당 메시지:** {spoiler_content}"
+            
+            # 유저 제재 처리 (타임아웃 및 전과 스택 누적)
+            await punish_user(message.guild, message.author, reason, punisher="시스템 자동 검열")
+            return
+
+    # 2. 검열 언어 검사 (메시지를 스포일러 형식으로 변경)
+    censor_words = settings.get("censor_words", [])
+    for word in censor_words:
+        if word in message.content:
+            try:
+                # 원본 메시지 삭제 후 스포일러 형태로 재송출
+                await message.delete()
+                await message.channel.send(f"⚠️ {message.author.mention}님의 메시지가 검열 단어 포함으로 블라인드 처리되었습니다:\n||{message.content}||")
+            except discord.Forbidden:
+                pass
+            return
+
+    # 기존 명령어 프리픽스 처리용 (사용 안 할 경우 생략 가능)
     if message.content.startswith(("! ", "!")):
         await bot.process_commands(message)
-        return
 
 # ================= [ 슬래시 명령어 전역 에러 핸들러 ] =================
 @bot.tree.error
@@ -371,6 +406,69 @@ async def set_auth_form(interaction: discord.Interaction, 양식: str):
     save_settings(GUILD_SETTINGS)
     await interaction.response.send_message("✅ 인증 가이드 및 양식 문장 정상 보관되었습니다.", ephemeral=True)
 
+# ================= [ 신규 기능: 자동 제재 및 검열 언어 다중 설정 ] =================
+
+@bot.tree.command(name="자동제재언어설정", description="해당 단어가 포함된 문장을 즉시 삭제하고 제재합니다. (쉼표로 여러 개 등록 가능)")
+@app_commands.describe(제재언어="제재할 언어나 단어를 입력하세요. 여러 개인 경우 쉼표(,)로 구분해 입력하세요.")
+@app_commands.default_permissions(administrator=True)
+async def set_auto_ban_words(interaction: discord.Interaction, 제재언어: str):
+    guild_id = interaction.guild.id
+    if guild_id not in GUILD_SETTINGS: GUILD_SETTINGS[guild_id] = {}
+    
+    # 쉼표 기준 분리 및 공백 제거
+    input_words = [w.strip() for w in 제재언어.split(",") if w.strip()]
+    
+    if "auto_ban_words" not in GUILD_SETTINGS[guild_id]:
+        GUILD_SETTINGS[guild_id]["auto_ban_words"] = []
+        
+    for word in input_words:
+        if word not in GUILD_SETTINGS[guild_id]["auto_ban_words"]:
+            GUILD_SETTINGS[guild_id]["auto_ban_words"].append(word)
+            
+    save_settings(GUILD_SETTINGS)
+    await interaction.response.send_message(f"✅ 자동 제재 언어 목록에 추가되었습니다: `{', '.join(input_words)}`", ephemeral=True)
+
+@bot.tree.command(name="자동제재언어초기화", description="등록되어 있던 모든 자동 제재 언어 목록을 초기화합니다.")
+@app_commands.default_permissions(administrator=True)
+async def clear_auto_ban_words(interaction: discord.Interaction):
+    guild_id = interaction.guild.id
+    if guild_id in GUILD_SETTINGS and "auto_ban_words" in GUILD_SETTINGS[guild_id]:
+        GUILD_SETTINGS[guild_id]["auto_ban_words"] = []
+        save_settings(GUILD_SETTINGS)
+        await interaction.response.send_message("🗑️ 자동 제재 언어 목록이 완전히 초기화되었습니다.", ephemeral=True)
+    else:
+        await interaction.response.send_message("❌ 등록된 제재 언어가 없습니다.", ephemeral=True)
+
+@bot.tree.command(name="검열언어설정", description="해당 단어가 포함된 문장을 클릭해야 보이는 스포일러 형식으로 바꿉니다.")
+@app_commands.describe(검열언어="검열할 언어나 단어를 입력하세요. 여러 개인 경우 쉼표(,)로 구분해 입력하세요.")
+@app_commands.default_permissions(administrator=True)
+async def set_censor_words(interaction: discord.Interaction, 검열언어: str):
+    guild_id = interaction.guild.id
+    if guild_id not in GUILD_SETTINGS: GUILD_SETTINGS[guild_id] = {}
+    
+    input_words = [w.strip() for w in 검열언어.split(",") if w.strip()]
+    
+    if "censor_words" not in GUILD_SETTINGS[guild_id]:
+        GUILD_SETTINGS[guild_id]["censor_words"] = []
+        
+    for word in input_words:
+        if word not in GUILD_SETTINGS[guild_id]["censor_words"]:
+            GUILD_SETTINGS[guild_id]["censor_words"].append(word)
+            
+    save_settings(GUILD_SETTINGS)
+    await interaction.response.send_message(f"✅ 검열 언어 목록에 추가되었습니다: `{', '.join(input_words)}`", ephemeral=True)
+
+@bot.tree.command(name="검열언어초기화", description="등록되어 있던 모든 검열 언어 목록을 초기화합니다.")
+@app_commands.default_permissions(administrator=True)
+async def clear_censor_words(interaction: discord.Interaction):
+    guild_id = interaction.guild.id
+    if guild_id in GUILD_SETTINGS and "censor_words" in GUILD_SETTINGS[guild_id]:
+        GUILD_SETTINGS[guild_id]["censor_words"] = []
+        save_settings(GUILD_SETTINGS)
+        await interaction.response.send_message("🗑️ 검열 언어 목록이 완전히 초기화되었습니다.", ephemeral=True)
+    else:
+        await interaction.response.send_message("❌ 등록된 검열 언어가 없습니다.", ephemeral=True)
+
 # ================= [ 🛠️ 유저 관리 및 가이드 명령어 파트 ] =================
 
 @bot.tree.command(name="인증완료", description="대상 대기자 유저에게 기본 역할과 성별/특수 역할을 목록에서 직접 선택해 원격 지급합니다.")
@@ -422,22 +520,22 @@ async def approve_user(interaction: discord.Interaction, 유저: discord.Member,
         await interaction.followup.send("❌ 봇의 서열(역할 순위)이 타겟 유저 또는 지급 역할보다 낮아 처리에 실패했습니다.")
 
 @bot.tree.command(name="제재", description="멤버 목록에서 유저를 정확히 지정해 수동 제재 및 전과 단계를 누적합니다.")
-@app_commands.describe(member="제재 대상 멤버를 목록에서 검색하여 선택하세요.", reason="제재 사유를 입력하세요.")
+@app_commands.describe(멤버="제재 대상 멤버를 목록에서 검색하여 선택하세요.", 사유="제재 사유를 입력하세요.")
 @app_commands.default_permissions(moderate_members=True)
-async def manual_punish_slash(interaction: discord.Interaction, member: discord.Member, reason: str = "관리자 수동 제재"):
+async def manual_punish_slash(interaction: discord.Interaction, 멤버: discord.Member, 사유: str = "관리자 수동 제재"):
     await interaction.response.defer(ephemeral=True)
     
-    if member.top_role >= interaction.guild.me.top_role:
+    if 멤버.top_role >= interaction.guild.me.top_role:
         await interaction.followup.send("❌ 봇의 역할 순위가 대상 유저보다 낮거나 같아 제재 처리에 실패했습니다.")
         return
         
-    await punish_user(interaction.guild, member, reason, str(interaction.user.name))
-    await interaction.followup.send(f"⚠️ {member.name} 유저에게 즉각적인 제재 및 전과 패널티를 부여했습니다.")
+    await punish_user(interaction.guild, 멤버, 사유, str(interaction.user.name))
+    await interaction.followup.send(f"⚠️ {멤버.name} 유저에게 즉각적인 제재 및 전과 패널티를 부여했습니다.")
 
 @bot.tree.command(name="제재지우기", description="멤버 목록에서 유저를 선택해 타임아웃을 풀고 전과 단계를 1범 감면합니다.")
-@app_commands.describe(member="제재 복구 대상 멤버를 목록에서 검색하여 선택하세요.")
+@app_commands.describe(멤버="제재 복구 대상 멤버를 목록에서 검색하여 선택하세요.")
 @app_commands.default_permissions(moderate_members=True)
-async def clear_punish_slash(interaction: discord.Interaction, member: discord.Member):
+async def clear_punish_slash(interaction: discord.Interaction, 멤버: discord.Member):
     await interaction.response.defer(ephemeral=True)
     guild = interaction.guild
 
@@ -448,15 +546,15 @@ async def clear_punish_slash(interaction: discord.Interaction, member: discord.M
     log_channel_id = GUILD_SETTINGS[guild.id]["punish_log_channel"]
     log_channel = guild.get_channel(log_channel_id)
 
-    if member.top_role >= guild.me.top_role:
+    if 멤버.top_role >= guild.me.top_role:
         await interaction.followup.send("❌ 대상 유저의 서열이 봇보다 높거나 같아 제재를 감면할 수 없습니다.")
         return
 
     try:
-        await member.edit(timed_out_until=None, reason="관리자가 제재 스택 감면")
+        await 멤버.edit(timed_out_until=None, reason="관리자가 제재 스택 감면")
         current_count = 0
         roles_to_remove = []
-        for r in member.roles:
+        for r in 멤버.roles:
             if r.name.startswith("전과 ") and r.name.endswith("범"):
                 try:
                     current_count = int(r.name.replace("전과 ", "").replace("범", "").strip())
@@ -465,7 +563,7 @@ async def clear_punish_slash(interaction: discord.Interaction, member: discord.M
                     continue
 
         if roles_to_remove:
-            await member.remove_roles(*roles_to_remove)
+            await 멤버.remove_roles(*roles_to_remove)
 
         next_count = max(0, current_count - 1)
         action_description = "대상자의 타임아웃 해제 및 전과 누적 단계를 전면 백지화(초기화)했습니다."
@@ -481,17 +579,17 @@ async def clear_punish_slash(interaction: discord.Interaction, member: discord.M
                         await log_channel.send("❌ **전과 스택 조정 실패:** 서버의 역할 개수 한도가 초과되었습니다.")
                     await interaction.followup.send("❌ 서버 역할 개수 제한으로 인해 새로운 전과 역할을 만들지 못했습니다.")
                     return
-            await member.add_roles(role)
+            await 멤버.add_roles(role)
             action_description = f"타임아웃을 해제하고 전과 스택을 1단계 격하했습니다. (**전과 {current_count}범** ➡️ **{new_role_name}**)"
 
         if log_channel:
             embed = discord.Embed(title="🔓 유저 제재 감면 및 복구 리포트", color=discord.Color.green(), timestamp=discord.utils.utcnow())
-            embed.add_field(name="👤 대상자", value=f"{member.mention} ({member.name})", inline=True)
+            embed.add_field(name="👤 대상자", value=f"{멤버.mention} ({멤버.name})", inline=True)
             embed.add_field(name="🔨 실행 관리자", value=str(interaction.user.name), inline=True)
             embed.description = action_description
             await log_channel.send(embed=embed)
 
-        await interaction.followup.send(f"🔓 {member.name} 유저의 제재 스택 감면 집행을 완료했습니다.")
+        await interaction.followup.send(f"🔓 {멤버.name} 유저의 제재 스택 감면 집행을 완료했습니다.")
     except discord.Forbidden:
         await interaction.followup.send("❌ 봇의 권한 등급(서열)이 멤버 권한보다 낮아 조치를 거부당했습니다.")
     except Exception as e:
@@ -511,7 +609,9 @@ async def send_system_guide(interaction: discord.Interaction):
         "• **/인증지급 `[@역할]`** : 승인 완료 시 줄 기본 역할들을 등록합니다. (여러 번 입력 시 누적 추가)\n"
         "• **/인증지급리셋** : 등록되어 있던 모든 기본 마스터 역할 목록을 비웁니다.\n"
         "• **/인증양식 `[문구]`** : 신입 멤버 입장 즉시 안내할 질문지 양식을 저장합니다. (`\\n`으로 줄바꿈 가능)\n"
-        "• **/인증완료 `[@유저]` `[@추가역할]`** : 대상 유저에게 기본 역할들과 선택한 성별/특수 역할을 함께 지급합니다."
+        "• **/인증완료 `[@유저]` `[@추가역할]`** : 대상 유저에게 기본 역할들과 선택한 성별/특수 역할을 함께 지급합니다.\n"
+        "• **/자동제재언어설정 `[단어,단어]`** : 입력 단어가 포함된 메시지 발견 즉시 삭제 후 자동 제재를 집행합니다.\n"
+        "• **/검열언어설정 `[단어,단어]`** : 입력 단어가 포함된 메시지를 스포일러 블라인드로 변경합니다."
     )
 
     penalty_text = (
