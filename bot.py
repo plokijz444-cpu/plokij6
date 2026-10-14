@@ -4,8 +4,8 @@ import datetime
 from flask import Flask
 from threading import Thread
 import os
-import typing
 import json
+import tempfile
 from discord import app_commands
 
 # ================= [ Render 24시간 가동을 위한 웹서버 ] =================
@@ -24,7 +24,7 @@ def keep_alive():
     t.daemon = True  
     t.start()
 
-# ================= [ 데이터베이스 관리 로직 (JSON) ] =================
+# ================= [ 데이터베이스 관리 로직 (JSON - 안전한 저장 방식) ] =================
 DATA_FILE = "guild_settings.json"
 
 def load_settings():
@@ -34,15 +34,20 @@ def load_settings():
         with open(DATA_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
             return {int(k): v for k, v in data.items()}
-    except Exception:
+    except Exception as e:
+        print(f"❌ 데이터 로드 중 오류 발생 (초기화 진행): {e}")
         return {}
 
 def save_settings(settings):
     try:
-        with open(DATA_FILE, "w", encoding="utf-8") as f:
-            json.dump({str(k): v for k, v in settings.items()}, f, ensure_ascii=False, indent=4)
+        data_to_save = {str(k): v for k, v in settings.items()}
+        dir_name = os.path.dirname(DATA_FILE) or '.'
+        with tempfile.NamedTemporaryFile('w', dir=dir_name, delete=False, encoding='utf-8') as tf:
+            json.dump(data_to_save, tf, ensure_ascii=False, indent=4)
+            temp_name = tf.name
+        os.replace(temp_name, DATA_FILE)
     except Exception as e:
-        print(f"❌ 데이터 저장 중 오류 발생: {e}")
+        print(f"❌ 데이터 저장 중 치명적 오류 발생: {e}")
 
 GUILD_SETTINGS = load_settings()
 
@@ -63,8 +68,14 @@ async def punish_user(guild: discord.Guild, member: discord.Member, reason: str,
 
     log_channel = guild.get_channel(log_channel_id)
     if not log_channel:
-        try: log_channel = await bot.fetch_channel(log_channel_id)
-        except Exception: log_channel = None
+        return  # 대규모 서버 트래픽 최적화를 위해 fetch_channel 제거 및 리턴
+
+    # [보안 코드 추가] 역할 서열(Hierarchy) 보호막
+    if member.top_role >= guild.me.top_role:
+        embed = discord.Embed(title="❌ 제재 실패", color=discord.Color.red())
+        embed.description = f"대상자 {member.mention}의 역할 서열이 봇보다 높거나 같아 제재할 수 없습니다."
+        await log_channel.send(embed=embed)
+        return
 
     current_count = 0
     roles_to_remove = []
@@ -81,13 +92,12 @@ async def punish_user(guild: discord.Guild, member: discord.Member, reason: str,
     try:
         if current_count >= 20:
             await member.ban(reason=f"전과 20범 달성 ({reason})")
-            if log_channel:
-                embed = discord.Embed(title="🚨 유저 영구 차단 (BAN)", color=discord.Color.red(), timestamp=discord.utils.utcnow())
-                embed.add_field(name="👤 대상자", value=f"{member.mention} ({member.name})", inline=True)
-                embed.add_field(name="🔨 집행자", value=str(punisher), inline=True)
-                embed.add_field(name="💬 최종 사유", value=reason, inline=False)
-                embed.set_footer(text="억울한 사항이 있다면 관리자에게 증거와 함께 자초지종을 DM으로 보내주세요")
-                await log_channel.send(embed=embed)
+            embed = discord.Embed(title="🚨 유저 영구 차단 (BAN)", color=discord.Color.red(), timestamp=discord.utils.utcnow())
+            embed.add_field(name="👤 대상자", value=f"{member.mention} ({member.name})", inline=True)
+            embed.add_field(name="🔨 집행자", value=str(punisher), inline=True)
+            embed.add_field(name="💬 최종 사유", value=reason, inline=False)
+            embed.set_footer(text="억울한 사항이 있다면 관리자에게 증거와 함께 자초지종을 DM으로 보내주세요")
+            await log_channel.send(embed=embed)
             return
 
         punish_days = min(current_count, 28)
@@ -98,29 +108,31 @@ async def punish_user(guild: discord.Guild, member: discord.Member, reason: str,
         role_name = f"전과 {current_count}범"
         role = discord.utils.get(guild.roles, name=role_name)
         if not role:
-            role = await guild.create_role(name=role_name, reason="전과 시스템 자동 생성")
+            # [보안 코드 추가] 서버 역할 250개 제한 대비 예외 처리
+            try:
+                role = await guild.create_role(name=role_name, reason="전과 시스템 자동 생성")
+            except discord.HTTPException as e:
+                await log_channel.send(f"❌ **역할 생성 실패:** 서버의 역할 개수 한도(250개)를 초과했거나 오류가 발생했습니다. `{e}`")
+                return
 
         if roles_to_remove:
             await member.remove_roles(*roles_to_remove)
         await member.add_roles(role)
 
-        if log_channel:
-            embed = discord.Embed(title="⚠️ 유저 제재 알림", color=discord.Color.orange(), timestamp=discord.utils.utcnow())
-            embed.add_field(name="👤 대상자", value=f"{member.mention} ({member.name})", inline=True)
-            embed.add_field(name="🔨 집행자", value=str(punisher), inline=True)
-            embed.add_field(name="📜 조치 내용", value=f"**{role_name}** 부여 및 **{punish_days}일간** 타임아웃", inline=False)
-            embed.add_field(name="💬 제재 사유", value=reason, inline=False)
-            embed.set_footer(text="억울한 사항이 있다면 관리자에게 증거와 함께 자초지종을 DM으로 보내주세요")
-            await log_channel.send(embed=embed)
+        embed = discord.Embed(title="⚠️ 유저 제재 알림", color=discord.Color.orange(), timestamp=discord.utils.utcnow())
+        embed.add_field(name="👤 대상자", value=f"{member.mention} ({member.name})", inline=True)
+        embed.add_field(name="🔨 집행자", value=str(punisher), inline=True)
+        embed.add_field(name="📜 조치 내용", value=f"**{role_name}** 부여 및 **{punish_days}일간** 타임아웃", inline=False)
+        embed.add_field(name="💬 제재 사유", value=reason, inline=False)
+        embed.set_footer(text="억울한 사항이 있다면 관리자에게 증거와 함께 자초지종을 DM으로 보내주세요")
+        await log_channel.send(embed=embed)
             
     except discord.Forbidden:
-        if log_channel:
-            embed = discord.Embed(title="❌ 제재 권한 실패 경고", color=discord.Color.dark_red())
-            embed.description = f"봇의 역할 순위가 {member.mention}님보다 낮아 제재 처리에 실패했습니다. 서버 설정에서 봇 역할을 위로 올려주세요."
-            await log_channel.send(embed=embed)
+        embed = discord.Embed(title="❌ 제재 권한 실패 경고", color=discord.Color.dark_red())
+        embed.description = f"봇의 역할 순위가 {member.mention}님보다 낮아 제재 처리에 실패했습니다. 서버 설정에서 봇 역할을 위로 올려주세요."
+        await log_channel.send(embed=embed)
     except Exception as e:
-        if log_channel:
-            await log_channel.send(f"❌ **제재 실행 중 시스템 에러 발생:** `{e}`")
+        await log_channel.send(f"❌ **제재 실행 중 시스템 에러 발생:** `{e}`")
 
 # ================= [ 이벤트 처리 ] =================
 @bot.event
@@ -152,10 +164,15 @@ async def on_guild_join(guild: discord.Guild):
                 embed.add_field(
                     name="📌 초기 필수 명령어 목록",
                     value=(
-                        "• `/인증방설정 채널:[#채널]`\n"
-                        "• `/제재로그설정 채널:[#채널]`\n"
-                        "• `/인증지급 역할:[@역할]` (여러 개 등록 가능)\n"
-                        "• `/인증양식 양식:[텍스트]`\n\n"
+                        "• `/인증방설정 채널:[#채널]`
+"
+                        "• `/제재로그설정 채널:[#채널]`
+"
+                        "• `/인증지급 역할:[@역할]` (여러 개 등록 가능)
+"
+                        "• `/인증양식 양식:[텍스트]`
+
+"
                         "자세한 사용법은 채팅창에 **`/가이드`**를 입력하여 확인하세요!"
                     ),
                     inline=False
@@ -177,14 +194,14 @@ async def on_member_join(member: discord.Member):
     auth_form = settings.get("auth_form")
 
     if auth_channel_id and auth_form:
-        auth_channel = member.guild.get_channel(auth_channel_id) or await bot.fetch_channel(auth_channel_id)
+        auth_channel = member.guild.get_channel(auth_channel_id)
         if auth_channel:
-            converted_form = auth_form.replace("\\n", "\n").replace("\n", "\n")
+            converted_form = auth_form.replace("\n", "\n").replace("\n", "\n")
             welcome_text = f"👋 {member.mention}님, 서버에 오신 것을 환영합니다!\n{converted_form}"
             await auth_channel.send(welcome_text)
 
     if join_log_id:
-        join_log_channel = member.guild.get_channel(join_log_id) or await bot.fetch_channel(join_log_id)
+        join_log_channel = member.guild.get_channel(join_log_id)
         if join_log_channel:
             now = datetime.datetime.now().strftime('%Y년 %m월 %d일 %H시 %M분')
             created_at = member.created_at.strftime('%Y년 %m월 %d일 %H시 %M분')
@@ -194,8 +211,8 @@ async def on_member_join(member: discord.Member):
             embed.add_field(name="⏰ 입장 시간", value=now, inline=True)
             embed.add_field(name="📅 계정 생성일", value=created_at, inline=True)
             
-            if member.avatar: embed.set_image(url=member.avatar.url)
-            else: embed.set_image(url=member.default_avatar.url)
+            avatar_url = member.avatar.url if member.avatar else member.default_avatar.url
+            embed.set_thumbnail(url=avatar_url)
             await join_log_channel.send(embed=embed)
 
 @bot.event
@@ -206,13 +223,13 @@ async def on_member_remove(member: discord.Member):
 
     leave_log_id = GUILD_SETTINGS[guild_id].get("leave_log_channel")
     if leave_log_id:
-        leave_log_channel = member.guild.get_channel(leave_log_id) or await bot.fetch_channel(leave_log_id)
+        leave_log_channel = member.guild.get_channel(leave_log_id)
         if leave_log_channel:
             embed = discord.Embed(title="📤 유저 서버 퇴장", color=discord.Color.red())
             embed.add_field(name="👤 퇴장 유저", value=f"{member.name} (ID: {member.id})", inline=False)
             
-            if member.avatar: embed.set_image(url=member.avatar.url)
-            else: embed.set_image(url=member.default_avatar.url)
+            avatar_url = member.avatar.url if member.avatar else member.default_avatar.url
+            embed.set_thumbnail(url=avatar_url)
             await leave_log_channel.send(embed=embed)
 
 @bot.event
@@ -222,15 +239,24 @@ async def on_message(message: discord.Message):
     if message.content.startswith(("! ", "!")):
         await bot.process_commands(message)
         return
-    if message.content == "안녕":
-        await message.channel.send(f"안녕하세요, {message.author.mention}님! 반가워요.")
-        return
+
+# ================= [ 슬래시 명령어 전역 에러 핸들러 ] =================
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("❌ 이 명령어를 사용할 권한(관리자 권한 등)이 없습니다.", ephemeral=True)
+    elif isinstance(error, app_commands.BotMissingPermissions):
+        await interaction.response.send_message("❌ 봇에게 필요한 권한이 부족하여 명령어를 실행할 수 없습니다.", ephemeral=True)
+    else:
+        print(f"슬래시 명령어 오류 발생: {error}")
+        if not interaction.response.is_done():
+            await interaction.response.send_message("❌ 명령어를 처리하는 중 알 수 없는 시스템 오류가 발생했습니다.", ephemeral=True)
 
 # ================= [ ⚙️ 관리자 설정 명령어 파트 ] =================
 
 @bot.tree.command(name="제재로그설정", description="서버의 제재 및 전과 내역이 기록될 채널을 지정합니다. (관리자 전용)")
 @app_commands.describe(채널="지정할 텍스트 채널을 선택하세요.")
-@commands.has_permissions(administrator=True)
+@app_commands.default_permissions(administrator=True)
 async def set_punish_log(interaction: discord.Interaction, 채널: discord.TextChannel):
     guild_id = interaction.guild.id
     if guild_id not in GUILD_SETTINGS: GUILD_SETTINGS[guild_id] = {}
@@ -239,7 +265,7 @@ async def set_punish_log(interaction: discord.Interaction, 채널: discord.TextC
     await interaction.response.send_message(f"✅ 제재 로그 채널이 {채널.mention}으로 설정되었습니다.", ephemeral=True)
 
 @bot.tree.command(name="제재로그제거", description="설정된 제재 로그 채널을 시스템에서 삭제합니다. (관리자 전용)")
-@commands.has_permissions(administrator=True)
+@app_commands.default_permissions(administrator=True)
 async def remove_punish_log(interaction: discord.Interaction):
     guild_id = interaction.guild.id
     if guild_id in GUILD_SETTINGS and "punish_log_channel" in GUILD_SETTINGS[guild_id]:
@@ -251,7 +277,7 @@ async def remove_punish_log(interaction: discord.Interaction):
 
 @bot.tree.command(name="인증방설정", description="신입 유저가 입장했을 때 양식을 보낼 인증 채널을 지정합니다. (관리자 전용)")
 @app_commands.describe(채널="지정할 인증 텍스트 채널을 선택하세요.")
-@commands.has_permissions(administrator=True)
+@app_commands.default_permissions(administrator=True)
 async def set_auth_channel(interaction: discord.Interaction, 채널: discord.TextChannel):
     guild_id = interaction.guild.id
     if guild_id not in GUILD_SETTINGS: GUILD_SETTINGS[guild_id] = {}
@@ -260,7 +286,7 @@ async def set_auth_channel(interaction: discord.Interaction, 채널: discord.Tex
     await interaction.response.send_message(f"✅ 인증 채널이 {채널.mention}으로 설정되었습니다.", ephemeral=True)
 
 @bot.tree.command(name="인증방제거", description="설정된 인증 채널 설정을 삭제합니다. (관리자 전용)")
-@commands.has_permissions(administrator=True)
+@app_commands.default_permissions(administrator=True)
 async def remove_auth_channel(interaction: discord.Interaction):
     guild_id = interaction.guild.id
     if guild_id in GUILD_SETTINGS and "auth_channel" in GUILD_SETTINGS[guild_id]:
@@ -272,7 +298,7 @@ async def remove_auth_channel(interaction: discord.Interaction):
 
 @bot.tree.command(name="입장로그설정", description="유저가 서버에 들어왔을 때 로그를 띄울 채널을 지정합니다. (관리자 전용)")
 @app_commands.describe(채널="지정할 입장 로그 채널을 선택하세요.")
-@commands.has_permissions(administrator=True)
+@app_commands.default_permissions(administrator=True)
 async def set_join_log(interaction: discord.Interaction, 채널: discord.TextChannel):
     guild_id = interaction.guild.id
     if guild_id not in GUILD_SETTINGS: GUILD_SETTINGS[guild_id] = {}
@@ -281,7 +307,7 @@ async def set_join_log(interaction: discord.Interaction, 채널: discord.TextCha
     await interaction.response.send_message(f"✅ 입장 로그 채널이 {채널.mention}으로 설정되었습니다.", ephemeral=True)
 
 @bot.tree.command(name="입장로그제거", description="설정된 입장 로그 채널을 삭제합니다. (관리자 전용)")
-@commands.has_permissions(administrator=True)
+@app_commands.default_permissions(administrator=True)
 async def remove_join_log(interaction: discord.Interaction):
     guild_id = interaction.guild.id
     if guild_id in GUILD_SETTINGS and "join_log_channel" in GUILD_SETTINGS[guild_id]:
@@ -293,7 +319,7 @@ async def remove_join_log(interaction: discord.Interaction):
 
 @bot.tree.command(name="퇴장로그설정", description="유저가 서버를 나갔을 때 로그를 띄울 채널을 지정합니다. (관리자 전용)")
 @app_commands.describe(채널="지정할 퇴장 로그 채널을 선택하세요.")
-@commands.has_permissions(administrator=True)
+@app_commands.default_permissions(administrator=True)
 async def set_leave_log(interaction: discord.Interaction, 채널: discord.TextChannel):
     guild_id = interaction.guild.id
     if guild_id not in GUILD_SETTINGS: GUILD_SETTINGS[guild_id] = {}
@@ -302,7 +328,7 @@ async def set_leave_log(interaction: discord.Interaction, 채널: discord.TextCh
     await interaction.response.send_message(f"✅ 퇴장 로그 채널이 {채널.mention}으로 설정되었습니다.", ephemeral=True)
 
 @bot.tree.command(name="퇴장로그제거", description="설정된 퇴장 로그 채널을 삭제합니다. (관리자 전용)")
-@commands.has_permissions(administrator=True)
+@app_commands.default_permissions(administrator=True)
 async def remove_leave_log(interaction: discord.Interaction):
     guild_id = interaction.guild.id
     if guild_id in GUILD_SETTINGS and "leave_log_channel" in GUILD_SETTINGS[guild_id]:
@@ -314,9 +340,14 @@ async def remove_leave_log(interaction: discord.Interaction):
 
 @bot.tree.command(name="인증지급", description="인증완료 시 지급할 기본 마스터 역할들을 누적 등록합니다. (관리자 전용)")
 @app_commands.describe(역할="지급할 기본 역할을 선택하세요. 여러 번 실행 시 다중 등록됩니다.")
-@commands.has_permissions(administrator=True)
+@app_commands.default_permissions(administrator=True)
 async def set_auth_role(interaction: discord.Interaction, 역할: discord.Role):
     guild_id = interaction.guild.id
+    
+    if 역할 >= interaction.guild.me.top_role:
+        await interaction.response.send_message("❌ 봇의 최고 역할보다 높거나 같은 역할은 등록할 수 없습니다.", ephemeral=True)
+        return
+
     if guild_id not in GUILD_SETTINGS: 
         GUILD_SETTINGS[guild_id] = {}
     
@@ -331,7 +362,7 @@ async def set_auth_role(interaction: discord.Interaction, 역할: discord.Role):
         await interaction.response.send_message(f"⚠️ **{역할.name}**은(는) 이미 기본 역할 목록에 등록되어 있습니다.", ephemeral=True)
 
 @bot.tree.command(name="인증지급리셋", description="등록되어 있던 모든 기본 마스터 역할 목록을 초기화합니다. (관리자 전용)")
-@commands.has_permissions(administrator=True)
+@app_commands.default_permissions(administrator=True)
 async def reset_auth_roles(interaction: discord.Interaction):
     guild_id = interaction.guild.id
     if guild_id in GUILD_SETTINGS and "auth_role_ids" in GUILD_SETTINGS[guild_id]:
@@ -343,22 +374,30 @@ async def reset_auth_roles(interaction: discord.Interaction):
 
 @bot.tree.command(name="인증양식", description="유저가 입장할 때 자동으로 보낼 가이드 안내 양식 문구를 등록합니다. (관리자 전용)")
 @app_commands.describe(양식="인증방에 출력할 문구를 작성하세요. (줄바꿈은 \n 문자를 사용하세요)")
-@commands.has_permissions(administrator=True)
+@app_commands.default_permissions(administrator=True)
 async def set_auth_form(interaction: discord.Interaction, 양식: str):
     guild_id = interaction.guild.id
     if guild_id not in GUILD_SETTINGS: GUILD_SETTINGS[guild_id] = {}
     GUILD_SETTINGS[guild_id]["auth_form"] = 양식
     save_settings(GUILD_SETTINGS)
-    await interaction.response.send_message("✅ 인증 가이드 및 양식 문장이 정상 보관되었습니다.", ephemeral=True)
+    await interaction.response.send_message("✅ 인증 가이드 및 양식 문장 정상 보관되었습니다.", ephemeral=True)
 
 # ================= [ 🛠️ 유저 관리 및 가이드 명령어 파트 ] =================
 
 @bot.tree.command(name="인증완료", description="대상 대기자 유저에게 기본 역할과 성별/특수 역할을 목록에서 직접 선택해 원격 지급합니다.")
 @app_commands.describe(유저="인증을 승인할 유저를 선택하세요.", 추가역할="성별(남자/여자)이나 추가로 얹어줄 특수 역할을 목록에서 선택하세요. (선택사항)")
-@commands.has_permissions(manage_roles=True)
+@app_commands.default_permissions(manage_roles=True)
 async def approve_user(interaction: discord.Interaction, 유저: discord.Member, 추가역할: discord.Role = None):
     await interaction.response.defer(ephemeral=True)
     guild = interaction.guild
+
+    if 유저.top_role >= guild.me.top_role:
+        await interaction.followup.send("❌ 대상 유저의 서열이 봇보다 높거나 같아 역할을 지급할 수 없습니다.")
+        return
+
+    if 추가역할 and 추가역할 >= guild.me.top_role:
+        await interaction.followup.send("❌ 지급하려는 추가 역할이 봇의 최고 역할보다 높거나 같습니다.")
+        return
 
     settings = GUILD_SETTINGS.get(guild.id, {})
     base_role_ids = settings.get("auth_role_ids", [])
@@ -369,45 +408,55 @@ async def approve_user(interaction: discord.Interaction, 유저: discord.Member,
         return
 
     roles_to_add = []
-    
     for r_id in base_role_ids:
         role = guild.get_role(r_id)
         if role:
+            if role >= guild.me.top_role:
+                continue
             roles_to_add.append(role)
 
     if 추가역할:
         roles_to_add.append(추가역할)
 
     if not roles_to_add:
-        await interaction.followup.send("❌ 지정된 역할들이 현재 이 서버에 존재하지 않습니다.")
+        await interaction.followup.send("❌ 지정된 역할들이 존재하지 않거나 봇이 지급할 수 없는 서열입니다.")
         return
 
     try:
         await 유저.add_roles(*roles_to_add, reason="관리자 수동 인증 완료 승인")
         
-        target_channel = guild.get_channel(auth_channel_id) if auth_channel_id else interaction.channel
+        target_channel = guild.get_channel(auth_channel_id) or interaction.channel
         if target_channel:
             roles_text = ", ".join([f"**{r.name}**" for r in roles_to_add])
             await target_channel.send(f"🎉 축하합니다 {유저.mention}님! 서류 인증이 승인되어 멤버 역할({roles_text}) 자격이 활성화되었습니다.")
         
         await interaction.followup.send(f"✅ {유저.name}님에게 성공적으로 {len(roles_to_add)}개의 역할을 지급하고 승인했습니다.")
     except discord.Forbidden:
-        await interaction.followup.send("❌ 봇의 서열(역할 순위)이 타겟 유저 또는 지급 역할보다 낮아 처리에 실패했습니다.")
+        await interaction.followup.send("❌ 봇의 권한 부족으로 처리에 실패했습니다. 역할 순위를 확인해 주세요.")
 
 @bot.tree.command(name="제재", description="멤버 목록에서 유저를 정확히 지정해 수동 제재 및 전과 단계를 누적합니다.")
 @app_commands.describe(member="제재 대상 멤버를 목록에서 검색하여 선택하세요.", reason="제재 사유를 입력하세요.")
-@commands.has_permissions(moderate_members=True)
+@app_commands.default_permissions(moderate_members=True)
 async def manual_punish_slash(interaction: discord.Interaction, member: discord.Member, reason: str = "관리자 수동 제재"):
     await interaction.response.defer(ephemeral=True)
+    
+    if member.top_role >= interaction.guild.me.top_role:
+        await interaction.followup.send("❌ 대상 유저의 서열이 봇보다 높거나 같아 제재할 수 없습니다.")
+        return
+
     await punish_user(interaction.guild, member, reason, str(interaction.user.name))
     await interaction.followup.send(f"⚠️ {member.name} 유저에게 즉각적인 제재 및 전과 패널티를 부여했습니다.")
 
 @bot.tree.command(name="제재지우기", description="멤버 목록에서 유저를 선택해 타임아웃을 풀고 전과 단계를 1범 감면합니다.")
 @app_commands.describe(member="제재 복구 대상 멤버를 목록에서 검색하여 선택하세요.")
-@commands.has_permissions(moderate_members=True)
+@app_commands.default_permissions(moderate_members=True)
 async def clear_punish_slash(interaction: discord.Interaction, member: discord.Member):
     await interaction.response.defer(ephemeral=True)
     guild = interaction.guild
+
+    if member.top_role >= guild.me.top_role:
+        await interaction.followup.send("❌ 대상 유저의 서열이 봇보다 높거나 같아 제재를 해제할 수 없습니다.")
+        return
 
     if guild.id not in GUILD_SETTINGS or "punish_log_channel" not in GUILD_SETTINGS[guild.id]:
         await interaction.followup.send("❌ 시스템 설정에 제재 로그방 정보가 없습니다. `/제재로그설정`을 먼저 실행하세요.")
@@ -436,9 +485,16 @@ async def clear_punish_slash(interaction: discord.Interaction, member: discord.M
 
         if next_count > 0:
             new_role_name = f"전과 {next_count}범"
-            role = discord.utils.get(guild.roles, name=new_role_name) or await guild.create_role(name=new_role_name)
-            await member.add_roles(role)
-            action_description = f"타임아웃을 해제하고 전과 스택을 1단계 격하했습니다. (**전과 {current_count}범** ➡️ **{new_role_name}**)"
+            role = discord.utils.get(guild.roles, name=new_role_name)
+            if not role:
+                try:
+                    role = await guild.create_role(name=new_role_name)
+                except discord.HTTPException:
+                    role = None
+
+            if role:
+                await member.add_roles(role)
+                action_description = f"타임아웃을 해제하고 전과 스택을 1단계 격하했습니다. (**전과 {current_count}범** ➡️ **{new_role_name}**)"
 
         if log_channel:
             embed = discord.Embed(title="🔓 유저 제재 감면 및 복구 리포트", color=discord.Color.green(), timestamp=discord.utils.utcnow())
