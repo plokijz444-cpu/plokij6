@@ -570,11 +570,9 @@ async def manual_punish_slash(interaction: discord.Interaction, 멤버들: str, 
 
     status_msg = ""
     if success_members:
-        status_msg += f"✅ **제재 완료:** {', '.join(success_members)}
-"
+        status_msg += f"✅ **제재 완료:** {', '.join(success_members)}\n"
     if failed_members:
-        status_msg += f"❌ **제재 실패:** {', '.join(failed_members)}
-"
+        status_msg += f"❌ **제재 실패:** {', '.join(failed_members)}\n"
     if not success_members and not failed_members:
         status_msg = "⚠️ 올바른 멤버 입력을 감지하지 못했습니다."
 
