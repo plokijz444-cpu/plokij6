@@ -407,7 +407,7 @@ async def set_auth_form(interaction: discord.Interaction, 양식: str):
     await interaction.response.send_message("✅ 인증 가이드 및 양식 문장 정상 보관되었습니다.", ephemeral=True)
 
 
-# ================= [ 🆕 자동 제재 및 검열 언어 다중 설정 커맨드 ] =================
+# ================= [ 자동 제재 및 검열 언어 다중 설정 커맨드 ] =================
 
 @bot.tree.command(name="자동제재언어설정", description="포함 시 즉시 삭제 및 자동 제재 처리할 단어들을 누적 등록합니다. 쉼표(,)로 다중 등록이 가능합니다. (관리자 전용)")
 @app_commands.describe(제재언어="제재할 단어들을 적어주세요. 여러 단어는 쉼표(,)로 구분해 한 번에 많이 넣을 수 있습니다.")
@@ -419,7 +419,6 @@ async def set_ban_words(interaction: discord.Interaction, 제재언어: str):
     if "ban_words" not in GUILD_SETTINGS[guild_id]:
         GUILD_SETTINGS[guild_id]["ban_words"] = []
 
-    # 쉼표로 분리하고 공백 제거 및 빈 문자열 필터링
     input_words = [w.strip() for w in 제재언어.split(",") if w.strip()]
     
     added_words = []
@@ -457,7 +456,6 @@ async def set_censor_words(interaction: discord.Interaction, 검열언어: str):
     if "censor_words" not in GUILD_SETTINGS[guild_id]:
         GUILD_SETTINGS[guild_id]["censor_words"] = []
 
-    # 쉼표로 분리하고 공백 제거 및 빈 문자열 필터링 (다중 입력 완벽 지원)
     input_words = [w.strip() for w in 검열언어.split(",") if w.strip()]
     
     added_words = []
@@ -535,18 +533,52 @@ async def approve_user(interaction: discord.Interaction, 유저: discord.Member,
     except discord.Forbidden:
         await interaction.followup.send("❌ 봇의 서열(역할 순위)이 타겟 유저 또는 지급 역할보다 낮아 처리에 실패했습니다.")
 
-@bot.tree.command(name="제재", description="멤버 목록에서 유저를 정확히 지정해 수동 제재 및 전과 단계를 누적합니다.")
-@app_commands.describe(멤버="제재 대상 멤버를 목록에서 검색하여 선택하세요.", 사유="제재 사유를 입력하세요.")
+@bot.tree.command(name="제재", description="여러 멤버의 멘션이나 ID를 쉼표(,)로 구분하여 한 번에 수동 제재합니다.")
+@app_commands.describe(멤버들="제재 대상 멤버들을 멘션하거나 ID를 적어주세요. 쉼표(,)로 여러 명 입력 가능합니다.", 사유="제재 사유를 입력하세요.")
 @app_commands.default_permissions(moderate_members=True)
-async def manual_punish_slash(interaction: discord.Interaction, 멤버: discord.Member, 사유: str = "관리자 수동 제재"):
+async def manual_punish_slash(interaction: discord.Interaction, 멤버들: str, 사유: str = "관리자 수동 제재"):
     await interaction.response.defer(ephemeral=True)
     
-    if 멤버.top_role >= interaction.guild.me.top_role:
-        await interaction.followup.send("❌ 봇의 역할 순위가 대상 유저보다 낮거나 같아 제재 처리에 실패했습니다.")
-        return
-        
-    await punish_user(interaction.guild, 멤버, 사유, str(interaction.user.name))
-    await interaction.followup.send(f"⚠️ {멤버.name} 유저에게 즉각적인 제재 및 전과 패널티를 부여했습니다.")
+    raw_inputs = [i.strip() for i in 멤버들.split(",") if i.strip()]
+    
+    success_members = []
+    failed_members = []
+    
+    for item in raw_inputs:
+        member = None
+        if item.startswith("<@") and item.endswith(">"):
+            clean_id = item.replace("<@", "").replace(">", "").replace("!", "")
+            try:
+                member = interaction.guild.get_member(int(clean_id))
+            except ValueError:
+                pass
+        elif item.isdigit():
+            member = interaction.guild.get_member(int(item))
+            
+        if not member:
+            member = discord.utils.get(interaction.guild.members, name=item)
+
+        if member:
+            if member.top_role >= interaction.guild.me.top_role:
+                failed_members.append(f"{member.name}(서열 서치 불가)")
+                continue
+                
+            await punish_user(interaction.guild, member, 사유, str(interaction.user.name))
+            success_members.append(member.name)
+        else:
+            failed_members.append(f"'{item}'(유저 검색 실패)")
+
+    status_msg = ""
+    if success_members:
+        status_msg += f"✅ **제재 완료:** {', '.join(success_members)}
+"
+    if failed_members:
+        status_msg += f"❌ **제재 실패:** {', '.join(failed_members)}
+"
+    if not success_members and not failed_members:
+        status_msg = "⚠️ 올바른 멤버 입력을 감지하지 못했습니다."
+
+    await interaction.followup.send(status_msg)
 
 @bot.tree.command(name="제재지우기", description="멤버 목록에서 유저를 선택해 타임아웃을 풀고 전과 단계를 1범 감면합니다.")
 @app_commands.describe(멤버="제재 복구 대상 멤버를 목록에서 검색하여 선택하세요.")
@@ -579,7 +611,7 @@ async def clear_punish_slash(interaction: discord.Interaction, 멤버: discord.M
                     continue
 
         if roles_to_remove:
-            await 멤버.remove_roles(*roles_to_remove)
+            await member.remove_roles(*roles_to_remove)
 
         next_count = max(0, current_count - 1)
         action_description = "대상자의 타임아웃 해제 및 전과 누적 단계를 전면 백지화(초기화)했습니다."
