@@ -68,12 +68,11 @@ async def punish_user(guild: discord.Guild, member: discord.Member, reason: str,
 
     log_channel = guild.get_channel(log_channel_id)
     if not log_channel:
-        return  # 대규모 서버 트래픽 최적화를 위해 fetch_channel 제거 및 리턴
+        return
 
-    # [보안 코드 추가] 역할 서열(Hierarchy) 보호막
     if member.top_role >= guild.me.top_role:
-        embed = discord.Embed(title="❌ 제재 실패", color=discord.Color.red())
-        embed.description = f"대상자 {member.mention}의 역할 서열이 봇보다 높거나 같아 제재할 수 없습니다."
+        embed = discord.Embed(title="❌ 제재 권한 실패 경고", color=discord.Color.dark_red())
+        embed.description = f"봇의 역할 순위가 대상 유저({member.mention})보다 낮거나 같아 제재할 수 없습니다."
         await log_channel.send(embed=embed)
         return
 
@@ -108,11 +107,10 @@ async def punish_user(guild: discord.Guild, member: discord.Member, reason: str,
         role_name = f"전과 {current_count}범"
         role = discord.utils.get(guild.roles, name=role_name)
         if not role:
-            # [보안 코드 추가] 서버 역할 250개 제한 대비 예외 처리
             try:
                 role = await guild.create_role(name=role_name, reason="전과 시스템 자동 생성")
             except discord.HTTPException as e:
-                await log_channel.send(f"❌ **역할 생성 실패:** 서버의 역할 개수 한도(250개)를 초과했거나 오류가 발생했습니다. `{e}`")
+                await log_channel.send(f"❌ **역할 생성 실패 (서버 제한 초과 가능성):** `{e.text}`")
                 return
 
         if roles_to_remove:
@@ -161,20 +159,12 @@ async def on_guild_join(guild: discord.Guild):
                     description="서버에 안전한 보안 인프라를 구축하기 위해 아래 가이드를 읽고 설정을 마쳐주세요.",
                     color=discord.Color.blue()
                 )
+                
+                guide_value = "• `/인증방설정 채널:[#채널]`\n• `/제재로그설정 채널:[#채널]`\n• `/인증지급 역할:[@역할]` (여러 개 등록 가능)\n• `/인증양식 양식:[텍스트]`\n\n자세한 사용법은 채팅창에 **`/가이드`**를 입력하여 확인하세요!"
+
                 embed.add_field(
                     name="📌 초기 필수 명령어 목록",
-                    value=(
-                        "• `/인증방설정 채널:[#채널]`
-"
-                        "• `/제재로그설정 채널:[#채널]`
-"
-                        "• `/인증지급 역할:[@역할]` (여러 개 등록 가능)
-"
-                        "• `/인증양식 양식:[텍스트]`
-
-"
-                        "자세한 사용법은 채팅창에 **`/가이드`**를 입력하여 확인하세요!"
-                    ),
+                    value=guide_value,
                     inline=False
                 )
                 await thread.send(embed=embed)
@@ -196,7 +186,7 @@ async def on_member_join(member: discord.Member):
     if auth_channel_id and auth_form:
         auth_channel = member.guild.get_channel(auth_channel_id)
         if auth_channel:
-            converted_form = auth_form.replace("\n", "\n").replace("\n", "\n")
+            converted_form = auth_form.replace("\\n", "\n").replace("\n", "\n")
             welcome_text = f"👋 {member.mention}님, 서버에 오신 것을 환영합니다!\n{converted_form}"
             await auth_channel.send(welcome_text)
 
@@ -343,9 +333,8 @@ async def remove_leave_log(interaction: discord.Interaction):
 @app_commands.default_permissions(administrator=True)
 async def set_auth_role(interaction: discord.Interaction, 역할: discord.Role):
     guild_id = interaction.guild.id
-    
     if 역할 >= interaction.guild.me.top_role:
-        await interaction.response.send_message("❌ 봇의 최고 역할보다 높거나 같은 역할은 등록할 수 없습니다.", ephemeral=True)
+        await interaction.response.send_message("❌ 봇의 서열과 같거나 더 높은 역할은 자동 지급용으로 등록할 수 없습니다.", ephemeral=True)
         return
 
     if guild_id not in GUILD_SETTINGS: 
@@ -392,11 +381,11 @@ async def approve_user(interaction: discord.Interaction, 유저: discord.Member,
     guild = interaction.guild
 
     if 유저.top_role >= guild.me.top_role:
-        await interaction.followup.send("❌ 대상 유저의 서열이 봇보다 높거나 같아 역할을 지급할 수 없습니다.")
+        await interaction.followup.send("❌ 봇의 서열이 대상 유저보다 낮거나 같아 역할을 지급할 수 없습니다.")
         return
 
     if 추가역할 and 추가역할 >= guild.me.top_role:
-        await interaction.followup.send("❌ 지급하려는 추가 역할이 봇의 최고 역할보다 높거나 같습니다.")
+        await interaction.followup.send("❌ 지급하려는 추가 역할의 서열이 봇의 서열보다 높거나 같아 지급할 수 없습니다.")
         return
 
     settings = GUILD_SETTINGS.get(guild.id, {})
@@ -410,16 +399,14 @@ async def approve_user(interaction: discord.Interaction, 유저: discord.Member,
     roles_to_add = []
     for r_id in base_role_ids:
         role = guild.get_role(r_id)
-        if role:
-            if role >= guild.me.top_role:
-                continue
+        if role and role < guild.me.top_role:
             roles_to_add.append(role)
 
     if 추가역할:
         roles_to_add.append(추가역할)
 
     if not roles_to_add:
-        await interaction.followup.send("❌ 지정된 역할들이 존재하지 않거나 봇이 지급할 수 없는 서열입니다.")
+        await interaction.followup.send("❌ 지정된 역할들이 존재하지 않거나 봇의 권한보다 높아서 지급할 수 없습니다.")
         return
 
     try:
@@ -432,7 +419,7 @@ async def approve_user(interaction: discord.Interaction, 유저: discord.Member,
         
         await interaction.followup.send(f"✅ {유저.name}님에게 성공적으로 {len(roles_to_add)}개의 역할을 지급하고 승인했습니다.")
     except discord.Forbidden:
-        await interaction.followup.send("❌ 봇의 권한 부족으로 처리에 실패했습니다. 역할 순위를 확인해 주세요.")
+        await interaction.followup.send("❌ 봇의 서열(역할 순위)이 타겟 유저 또는 지급 역할보다 낮아 처리에 실패했습니다.")
 
 @bot.tree.command(name="제재", description="멤버 목록에서 유저를 정확히 지정해 수동 제재 및 전과 단계를 누적합니다.")
 @app_commands.describe(member="제재 대상 멤버를 목록에서 검색하여 선택하세요.", reason="제재 사유를 입력하세요.")
@@ -441,9 +428,9 @@ async def manual_punish_slash(interaction: discord.Interaction, member: discord.
     await interaction.response.defer(ephemeral=True)
     
     if member.top_role >= interaction.guild.me.top_role:
-        await interaction.followup.send("❌ 대상 유저의 서열이 봇보다 높거나 같아 제재할 수 없습니다.")
+        await interaction.followup.send("❌ 봇의 역할 순위가 대상 유저보다 낮거나 같아 제재 처리에 실패했습니다.")
         return
-
+        
     await punish_user(interaction.guild, member, reason, str(interaction.user.name))
     await interaction.followup.send(f"⚠️ {member.name} 유저에게 즉각적인 제재 및 전과 패널티를 부여했습니다.")
 
@@ -454,16 +441,16 @@ async def clear_punish_slash(interaction: discord.Interaction, member: discord.M
     await interaction.response.defer(ephemeral=True)
     guild = interaction.guild
 
-    if member.top_role >= guild.me.top_role:
-        await interaction.followup.send("❌ 대상 유저의 서열이 봇보다 높거나 같아 제재를 해제할 수 없습니다.")
-        return
-
     if guild.id not in GUILD_SETTINGS or "punish_log_channel" not in GUILD_SETTINGS[guild.id]:
         await interaction.followup.send("❌ 시스템 설정에 제재 로그방 정보가 없습니다. `/제재로그설정`을 먼저 실행하세요.")
         return
 
     log_channel_id = GUILD_SETTINGS[guild.id]["punish_log_channel"]
     log_channel = guild.get_channel(log_channel_id)
+
+    if member.top_role >= guild.me.top_role:
+        await interaction.followup.send("❌ 대상 유저의 서열이 봇보다 높거나 같아 제재를 감면할 수 없습니다.")
+        return
 
     try:
         await member.edit(timed_out_until=None, reason="관리자가 제재 스택 감면")
@@ -490,11 +477,12 @@ async def clear_punish_slash(interaction: discord.Interaction, member: discord.M
                 try:
                     role = await guild.create_role(name=new_role_name)
                 except discord.HTTPException:
-                    role = None
-
-            if role:
-                await member.add_roles(role)
-                action_description = f"타임아웃을 해제하고 전과 스택을 1단계 격하했습니다. (**전과 {current_count}범** ➡️ **{new_role_name}**)"
+                    if log_channel:
+                        await log_channel.send("❌ **전과 스택 조정 실패:** 서버의 역할 개수 한도가 초과되었습니다.")
+                    await interaction.followup.send("❌ 서버 역할 개수 제한으로 인해 새로운 전과 역할을 만들지 못했습니다.")
+                    return
+            await member.add_roles(role)
+            action_description = f"타임아웃을 해제하고 전과 스택을 1단계 격하했습니다. (**전과 {current_count}범** ➡️ **{new_role_name}**)"
 
         if log_channel:
             embed = discord.Embed(title="🔓 유저 제재 감면 및 복구 리포트", color=discord.Color.green(), timestamp=discord.utils.utcnow())
