@@ -24,7 +24,7 @@ def keep_alive():
     t.daemon = True  
     t.start()
 
-# ================= [ 데이터베이스 관리 로직 (JSON - 안전한 저장 방식) ] =================
+# ================= [ 데이터베이스 관리 로직 ] =================
 DATA_FILE = "guild_settings.json"
 
 def load_settings():
@@ -222,7 +222,7 @@ async def on_member_remove(member: discord.Member):
             embed.set_thumbnail(url=avatar_url)
             await leave_log_channel.send(embed=embed)
 
-# ================= [ 자동 제재 및 검열 언어 감지 로직 ] =================
+# ================= [ 실시간 문자 검열 및 자동 제재 엔진 ] =================
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot or not message.guild:
@@ -231,9 +231,11 @@ async def on_message(message: discord.Message):
     guild_id = message.guild.id
     settings = GUILD_SETTINGS.get(guild_id, {})
     
-    # 1. 자동 제재 언어 검사
-    auto_ban_words = settings.get("auto_ban_words", [])
-    for word in auto_ban_words:
+    ban_words = settings.get("ban_words", [])
+    censor_words = settings.get("censor_words", [])
+
+    # 1. 자동 제재 단어 체크 (즉시 삭제 후 차단/타임아웃 및 로그 전송)
+    for word in ban_words:
         if word in message.content:
             try:
                 # 메시지 즉시 삭제
@@ -241,29 +243,27 @@ async def on_message(message: discord.Message):
             except discord.Forbidden:
                 pass
             
-            # 클릭하면 보이는 스포일러 메시지 형식 복사
+            # 클릭해야만 보이는 메시지 형식 (스포일러 텍스트) 빌드
             spoiler_content = f"||{message.content}||"
-            reason = f"자동 제재 대상 단어 포함: '{word}'\n**해당 메시지:** {spoiler_content}"
+            reason = f"자동 제재 대상 단어 [{word}] 포함 문장 작성"
             
-            # 유저 제재 처리 (타임아웃 및 전과 스택 누적)
-            await punish_user(message.guild, message.author, reason, punisher="시스템 자동 검열")
+            # 수동 제재와 동일한 로그 시스템 가동 (스포일러 처리된 원래 메시지 포함)
+            await punish_user(message.guild, message.author, f"{reason}\n포착된 메시지: {spoiler_content}", "시스템 자동 검열")
             return
 
-    # 2. 검열 언어 검사 (메시지를 스포일러 형식으로 변경)
-    censor_words = settings.get("censor_words", [])
+    # 2. 일반 검열 단어 체크 (스포일러 메시지 형식으로 전환)
     for word in censor_words:
         if word in message.content:
             try:
-                # 원본 메시지 삭제 후 스포일러 형태로 재송출
                 await message.delete()
-                await message.channel.send(f"⚠️ {message.author.mention}님의 메시지가 검열 단어 포함으로 블라인드 처리되었습니다:\n||{message.content}||")
             except discord.Forbidden:
                 pass
+            
+            # 클릭해야만 보이고 보낸 사람을 알 수 있게 재송출
+            await message.channel.send(f"⚠️ {message.author.mention}님의 메시지에 검열 대상 단어가 포함되어 스포일러 처리되었습니다:\n||{message.content}||")
             return
 
-    # 기존 명령어 프리픽스 처리용 (사용 안 할 경우 생략 가능)
-    if message.content.startswith(("! ", "!")):
-        await bot.process_commands(message)
+    await bot.process_commands(message)
 
 # ================= [ 슬래시 명령어 전역 에러 핸들러 ] =================
 @bot.tree.error
@@ -406,68 +406,84 @@ async def set_auth_form(interaction: discord.Interaction, 양식: str):
     save_settings(GUILD_SETTINGS)
     await interaction.response.send_message("✅ 인증 가이드 및 양식 문장 정상 보관되었습니다.", ephemeral=True)
 
-# ================= [ 신규 기능: 자동 제재 및 검열 언어 다중 설정 ] =================
 
-@bot.tree.command(name="자동제재언어설정", description="해당 단어가 포함된 문장을 즉시 삭제하고 제재합니다. (쉼표로 여러 개 등록 가능)")
-@app_commands.describe(제재언어="제재할 언어나 단어를 입력하세요. 여러 개인 경우 쉼표(,)로 구분해 입력하세요.")
+# ================= [ 🆕 자동 제재 및 검열 언어 다중 설정 커맨드 ] =================
+
+@bot.tree.command(name="자동제재언어설정", description="포함 시 즉시 삭제 및 자동 제재 처리할 단어들을 누적 등록합니다. 쉼표(,)로 다중 등록이 가능합니다. (관리자 전용)")
+@app_commands.describe(제재언어="제재할 단어들을 적어주세요. 여러 단어는 쉼표(,)로 구분해 한 번에 많이 넣을 수 있습니다.")
 @app_commands.default_permissions(administrator=True)
-async def set_auto_ban_words(interaction: discord.Interaction, 제재언어: str):
+async def set_ban_words(interaction: discord.Interaction, 제재언어: str):
     guild_id = interaction.guild.id
-    if guild_id not in GUILD_SETTINGS: GUILD_SETTINGS[guild_id] = {}
-    
-    # 쉼표 기준 분리 및 공백 제거
+    if guild_id not in GUILD_SETTINGS:
+        GUILD_SETTINGS[guild_id] = {}
+    if "ban_words" not in GUILD_SETTINGS[guild_id]:
+        GUILD_SETTINGS[guild_id]["ban_words"] = []
+
+    # 쉼표로 분리하고 공백 제거 및 빈 문자열 필터링
     input_words = [w.strip() for w in 제재언어.split(",") if w.strip()]
     
-    if "auto_ban_words" not in GUILD_SETTINGS[guild_id]:
-        GUILD_SETTINGS[guild_id]["auto_ban_words"] = []
-        
+    added_words = []
     for word in input_words:
-        if word not in GUILD_SETTINGS[guild_id]["auto_ban_words"]:
-            GUILD_SETTINGS[guild_id]["auto_ban_words"].append(word)
-            
+        if word not in GUILD_SETTINGS[guild_id]["ban_words"]:
+            GUILD_SETTINGS[guild_id]["ban_words"].append(word)
+            added_words.append(word)
+
+    if not added_words:
+        await interaction.response.send_message("⚠️ 입력한 단어들은 이미 모두 등록되어 있거나 유효하지 않습니다.", ephemeral=True)
+        return
+
     save_settings(GUILD_SETTINGS)
-    await interaction.response.send_message(f"✅ 자동 제재 언어 목록에 추가되었습니다: `{', '.join(input_words)}`", ephemeral=True)
+    await interaction.response.send_message(f"🚨 **자동 제재 단어 추가 완료:** `{', '.join(added_words)}` 가 서버 필터에 바인딩되었습니다.", ephemeral=True)
 
-@bot.tree.command(name="자동제재언어초기화", description="등록되어 있던 모든 자동 제재 언어 목록을 초기화합니다.")
+@bot.tree.command(name="자동제재언어초기화", description="등록되어 작동 중인 모든 자동 제재 대상 언어 데이터베이스를 초기화합니다. (관리자 전용)")
 @app_commands.default_permissions(administrator=True)
-async def clear_auto_ban_words(interaction: discord.Interaction):
+async def reset_ban_words(interaction: discord.Interaction):
     guild_id = interaction.guild.id
-    if guild_id in GUILD_SETTINGS and "auto_ban_words" in GUILD_SETTINGS[guild_id]:
-        GUILD_SETTINGS[guild_id]["auto_ban_words"] = []
+    if guild_id in GUILD_SETTINGS and "ban_words" in GUILD_SETTINGS[guild_id]:
+        GUILD_SETTINGS[guild_id]["ban_words"] = []
         save_settings(GUILD_SETTINGS)
-        await interaction.response.send_message("🗑️ 자동 제재 언어 목록이 완전히 초기화되었습니다.", ephemeral=True)
+        await interaction.response.send_message("🗑️ 모든 자동 제재 언어 목록이 청소되었습니다.", ephemeral=True)
     else:
-        await interaction.response.send_message("❌ 등록된 제재 언어가 없습니다.", ephemeral=True)
+        await interaction.response.send_message("❌ 등록된 제재 언어 리스트가 없습니다.", ephemeral=True)
 
-@bot.tree.command(name="검열언어설정", description="해당 단어가 포함된 문장을 클릭해야 보이는 스포일러 형식으로 바꿉니다.")
-@app_commands.describe(검열언어="검열할 언어나 단어를 입력하세요. 여러 개인 경우 쉼표(,)로 구분해 입력하세요.")
+
+@bot.tree.command(name="검열언어설정", description="포함 시 메시지를 스포일러 기법으로 변경 처리할 단어들을 누적 등록합니다. 쉼표(,)로 다중 등록이 가능합니다. (관리자 전용)")
+@app_commands.describe(검열언어="검열할 단어들을 적어주세요. 여러 단어는 쉼표(,)로 구분해 한 번에 많이 넣을 수 있습니다.")
 @app_commands.default_permissions(administrator=True)
 async def set_censor_words(interaction: discord.Interaction, 검열언어: str):
     guild_id = interaction.guild.id
-    if guild_id not in GUILD_SETTINGS: GUILD_SETTINGS[guild_id] = {}
-    
-    input_words = [w.strip() for w in 검열언어.split(",") if w.strip()]
-    
+    if guild_id not in GUILD_SETTINGS:
+        GUILD_SETTINGS[guild_id] = {}
     if "censor_words" not in GUILD_SETTINGS[guild_id]:
         GUILD_SETTINGS[guild_id]["censor_words"] = []
-        
+
+    # 쉼표로 분리하고 공백 제거 및 빈 문자열 필터링 (다중 입력 완벽 지원)
+    input_words = [w.strip() for w in 검열언어.split(",") if w.strip()]
+    
+    added_words = []
     for word in input_words:
         if word not in GUILD_SETTINGS[guild_id]["censor_words"]:
             GUILD_SETTINGS[guild_id]["censor_words"].append(word)
-            
-    save_settings(GUILD_SETTINGS)
-    await interaction.response.send_message(f"✅ 검열 언어 목록에 추가되었습니다: `{', '.join(input_words)}`", ephemeral=True)
+            added_words.append(word)
 
-@bot.tree.command(name="검열언어초기화", description="등록되어 있던 모든 검열 언어 목록을 초기화합니다.")
+    if not added_words:
+        await interaction.response.send_message("⚠️ 입력한 검열 단어들은 이미 모두 등록되어 있거나 유효하지 않습니다.", ephemeral=True)
+        return
+
+    save_settings(GUILD_SETTINGS)
+    await interaction.response.send_message(f"🔒 **스포일러 검열 단어 추가 완료:** `{', '.join(added_words)}` 가 서버 필터에 누적 등록되었습니다.", ephemeral=True)
+
+@bot.tree.command(name="검열언어초기화", description="등록되어 작동 중인 모든 스포일러 검열 대상 언어 데이터베이스를 초기화합니다. (관리자 전용)")
 @app_commands.default_permissions(administrator=True)
-async def clear_censor_words(interaction: discord.Interaction):
+async def reset_censor_words(interaction: discord.Interaction):
     guild_id = interaction.guild.id
     if guild_id in GUILD_SETTINGS and "censor_words" in GUILD_SETTINGS[guild_id]:
         GUILD_SETTINGS[guild_id]["censor_words"] = []
         save_settings(GUILD_SETTINGS)
-        await interaction.response.send_message("🗑️ 검열 언어 목록이 완전히 초기화되었습니다.", ephemeral=True)
+        await interaction.response.send_message("🗑️ 모든 스포일러 검열 언어 목록이 초기화되었습니다.", ephemeral=True)
     else:
-        await interaction.response.send_message("❌ 등록된 검열 언어가 없습니다.", ephemeral=True)
+        await interaction.response.send_message("❌ 등록된 검열 언어 리스트가 없습니다.", ephemeral=True)
+
 
 # ================= [ 🛠️ 유저 관리 및 가이드 명령어 파트 ] =================
 
@@ -610,8 +626,8 @@ async def send_system_guide(interaction: discord.Interaction):
         "• **/인증지급리셋** : 등록되어 있던 모든 기본 마스터 역할 목록을 비웁니다.\n"
         "• **/인증양식 `[문구]`** : 신입 멤버 입장 즉시 안내할 질문지 양식을 저장합니다. (`\\n`으로 줄바꿈 가능)\n"
         "• **/인증완료 `[@유저]` `[@추가역할]`** : 대상 유저에게 기본 역할들과 선택한 성별/특수 역할을 함께 지급합니다.\n"
-        "• **/자동제재언어설정 `[단어,단어]`** : 입력 단어가 포함된 메시지 발견 즉시 삭제 후 자동 제재를 집행합니다.\n"
-        "• **/검열언어설정 `[단어,단어]`** : 입력 단어가 포함된 메시지를 스포일러 블라인드로 변경합니다."
+        "• **/자동제재언어설정 `[단어1, 단어2]`** : 제재할 언어들을 쉼표로 구분하여 여러 개 등록합니다.\n"
+        "• **/검열언어설정 `[단어1, 단어2]`** : 스포일러 처리할 언어들을 쉼표로 구분하여 여러 개 등록합니다."
     )
 
     penalty_text = (
