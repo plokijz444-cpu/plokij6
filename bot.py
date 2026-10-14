@@ -1,6 +1,7 @@
 import discord
 from discord.ext import commands
 import datetime
+import asyncio
 from flask import Flask
 from threading import Thread
 import os
@@ -419,20 +420,20 @@ async def set_auth_form(interaction: discord.Interaction, 양식: str):
     await interaction.response.send_message("✅ 인증 가이드 및 양식 문장 정상 보관되었습니다.", ephemeral=True)
 
 
-# ================= [ 자동 제재 및 검열 언어 다중 설정 커맨드 ] =================
+# ================= [ 제재/검열 단어 설정 · 확인 · 삭제 커맨드 ] =================
 
-@bot.tree.command(name="자동제재언어설정", description="포함 시 즉시 삭제 및 자동 제재 처리할 단어들을 누적 등록합니다. 쉼표(,)로 다중 등록이 가능합니다. (관리자 전용)")
-@app_commands.describe(제재언어="제재할 단어들을 적어주세요. 여러 단어는 쉼표(,)로 구분해 한 번에 많이 넣을 수 있습니다.")
+@bot.tree.command(name="제재단어설정", description="포함 시 즉시 삭제 및 자동 제재 처리할 단어들을 누적 등록합니다. 쉼표(,)로 다중 등록이 가능합니다. (관리자 전용)")
+@app_commands.describe(제재단어="제재할 단어들을 적어주세요. 여러 단어는 쉼표(,)로 구분해 한 번에 많이 넣을 수 있습니다.")
 @app_commands.default_permissions(administrator=True)
-async def set_ban_words(interaction: discord.Interaction, 제재언어: str):
+async def set_ban_words(interaction: discord.Interaction, 제재단어: str):
     guild_id = interaction.guild.id
     if guild_id not in GUILD_SETTINGS:
         GUILD_SETTINGS[guild_id] = {}
     if "ban_words" not in GUILD_SETTINGS[guild_id]:
         GUILD_SETTINGS[guild_id]["ban_words"] = []
 
-    input_words = [w.strip() for w in 제재언어.split(",") if w.strip()]
-    
+    input_words = [w.strip() for w in 제재단어.split(",") if w.strip()]
+
     added_words = []
     for word in input_words:
         if word not in GUILD_SETTINGS[guild_id]["ban_words"]:
@@ -446,30 +447,96 @@ async def set_ban_words(interaction: discord.Interaction, 제재언어: str):
     save_settings(GUILD_SETTINGS)
     await interaction.response.send_message(f"🚨 **자동 제재 단어 추가 완료:** `{', '.join(added_words)}` 가 서버 필터에 바인딩되었습니다.", ephemeral=True)
 
-@bot.tree.command(name="자동제재언어초기화", description="등록되어 작동 중인 모든 자동 제재 대상 언어 데이터베이스를 초기화합니다. (관리자 전용)")
+# ---------- 단어 목록 초기화 (✅/❌ 반응으로 이중 확인) ----------
+RESET_CONFIRM_TIMEOUT = 60  # 선택 대기 시간(초)
+
+async def _confirm_and_reset_words(interaction: discord.Interaction, key: str, label: str):
+    guild_id = interaction.guild.id
+    words = GUILD_SETTINGS.get(guild_id, {}).get(key, [])
+    if not words:
+        await interaction.response.send_message(f"❌ 등록된 {label}가 없어 초기화할 내용이 없습니다.", ephemeral=True)
+        return
+
+    warn_text = (
+        f"⚠️ **경고: {label} 전체 초기화**\n"
+        f"{interaction.user.mention}님, 등록된 {label} **{len(words)}개**가 모두 삭제되며 되돌릴 수 없습니다.\n\n"
+        f"✅ 를 누르면 **초기화 진행** / ❌ 를 누르면 **취소**\n"
+        f"(명령어를 입력한 본인만 선택할 수 있으며, {RESET_CONFIRM_TIMEOUT}초 안에 선택하지 않으면 자동 취소됩니다.)"
+    )
+    await interaction.response.send_message(warn_text)
+    warn_msg = await interaction.original_response()
+
+    async def delete_warning():
+        try:
+            await interaction.delete_original_response()
+        except discord.HTTPException:
+            pass
+
+    async def notice(text: str):
+        # 5초 뒤 자동으로 사라지는 안내 메시지
+        try:
+            await interaction.channel.send(text, delete_after=5)
+        except (discord.HTTPException, AttributeError):
+            pass
+
+    # 바로 누를 수 있도록 봇이 미리 반응을 달아 둠
+    try:
+        await warn_msg.add_reaction("✅")
+        await warn_msg.add_reaction("❌")
+    except discord.HTTPException:
+        await delete_warning()
+        await interaction.followup.send("❌ 반응(이모지)을 추가할 권한이 없어 초기화를 진행할 수 없습니다. 봇에 '반응 추가하기', '메시지 기록 보기' 권한을 주세요.", ephemeral=True)
+        return
+
+    def check(payload: discord.RawReactionActionEvent):
+        return (
+            payload.message_id == warn_msg.id
+            and payload.user_id == interaction.user.id
+            and str(payload.emoji) in ("✅", "❌")
+        )
+
+    try:
+        payload = await bot.wait_for("raw_reaction_add", check=check, timeout=RESET_CONFIRM_TIMEOUT)
+    except asyncio.TimeoutError:
+        await delete_warning()
+        await notice(f"⏰ {interaction.user.mention} 시간이 초과되어 {label} 초기화가 취소되었습니다.")
+        return
+
+    await delete_warning()
+
+    if str(payload.emoji) == "✅":
+        if guild_id in GUILD_SETTINGS and GUILD_SETTINGS[guild_id].get(key):
+            GUILD_SETTINGS[guild_id][key] = []
+            save_settings(GUILD_SETTINGS)
+        try:
+            await interaction.followup.send(f"🗑️ 등록된 {label} {len(words)}개가 모두 초기화되었습니다.", ephemeral=True)
+        except discord.HTTPException:
+            pass
+    else:
+        await notice(f"🚫 {interaction.user.mention} {label} 초기화가 거절(취소)되었습니다. 기존 단어는 그대로 유지됩니다.")
+
+@bot.tree.command(name="제재단어초기화", description="등록된 모든 자동 제재 단어를 초기화합니다. ✅/❌ 반응으로 한 번 더 확인합니다. (관리자 전용)")
 @app_commands.default_permissions(administrator=True)
 async def reset_ban_words(interaction: discord.Interaction):
-    guild_id = interaction.guild.id
-    if guild_id in GUILD_SETTINGS and "ban_words" in GUILD_SETTINGS[guild_id]:
-        GUILD_SETTINGS[guild_id]["ban_words"] = []
-        save_settings(GUILD_SETTINGS)
-        await interaction.response.send_message("🗑️ 모든 자동 제재 언어 목록이 청소되었습니다.", ephemeral=True)
-    else:
-        await interaction.response.send_message("❌ 등록된 제재 언어 리스트가 없습니다.", ephemeral=True)
+    await _confirm_and_reset_words(interaction, "ban_words", "제재 단어")
 
-
-@bot.tree.command(name="검열언어설정", description="포함 시 메시지를 스포일러 기법으로 변경 처리할 단어들을 누적 등록합니다. 쉼표(,)로 다중 등록이 가능합니다. (관리자 전용)")
-@app_commands.describe(검열언어="검열할 단어들을 적어주세요. 여러 단어는 쉼표(,)로 구분해 한 번에 많이 넣을 수 있습니다.")
+@bot.tree.command(name="검열단어초기화", description="등록된 모든 스포일러 검열 단어를 초기화합니다. ✅/❌ 반응으로 한 번 더 확인합니다. (관리자 전용)")
 @app_commands.default_permissions(administrator=True)
-async def set_censor_words(interaction: discord.Interaction, 검열언어: str):
+async def reset_censor_words(interaction: discord.Interaction):
+    await _confirm_and_reset_words(interaction, "censor_words", "검열 단어")
+
+@bot.tree.command(name="검열단어설정", description="포함 시 메시지를 스포일러 기법으로 변경 처리할 단어들을 누적 등록합니다. 쉼표(,)로 다중 등록이 가능합니다. (관리자 전용)")
+@app_commands.describe(검열단어="검열할 단어들을 적어주세요. 여러 단어는 쉼표(,)로 구분해 한 번에 많이 넣을 수 있습니다.")
+@app_commands.default_permissions(administrator=True)
+async def set_censor_words(interaction: discord.Interaction, 검열단어: str):
     guild_id = interaction.guild.id
     if guild_id not in GUILD_SETTINGS:
         GUILD_SETTINGS[guild_id] = {}
     if "censor_words" not in GUILD_SETTINGS[guild_id]:
         GUILD_SETTINGS[guild_id]["censor_words"] = []
 
-    input_words = [w.strip() for w in 검열언어.split(",") if w.strip()]
-    
+    input_words = [w.strip() for w in 검열단어.split(",") if w.strip()]
+
     added_words = []
     for word in input_words:
         if word not in GUILD_SETTINGS[guild_id]["censor_words"]:
@@ -483,16 +550,118 @@ async def set_censor_words(interaction: discord.Interaction, 검열언어: str):
     save_settings(GUILD_SETTINGS)
     await interaction.response.send_message(f"🔒 **스포일러 검열 단어 추가 완료:** `{', '.join(added_words)}` 가 서버 필터에 누적 등록되었습니다.", ephemeral=True)
 
-@bot.tree.command(name="검열언어초기화", description="등록되어 작동 중인 모든 스포일러 검열 대상 언어 데이터베이스를 초기화합니다. (관리자 전용)")
+# ---------- 단어 목록 확인 ----------
+async def _show_words(interaction: discord.Interaction, key: str, label: str, emoji: str):
+    words = GUILD_SETTINGS.get(interaction.guild.id, {}).get(key, [])
+    if not words:
+        await interaction.response.send_message(f"❌ 등록된 {label}가 없습니다.", ephemeral=True)
+        return
+
+    word_text = ", ".join(f"`{w}`" for w in words)
+    if len(word_text) > 3900:
+        word_text = word_text[:3900] + " …(일부 생략)"
+    embed = discord.Embed(
+        title=f"{emoji} 등록된 {label} ({len(words)}개)",
+        description=word_text,
+        color=discord.Color.orange()
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="제재단어확인", description="지금까지 등록한 자동 제재 단어 목록을 확인합니다. (관리자 전용)")
 @app_commands.default_permissions(administrator=True)
-async def reset_censor_words(interaction: discord.Interaction):
+async def show_ban_words(interaction: discord.Interaction):
+    await _show_words(interaction, "ban_words", "제재 단어", "🚨")
+
+@bot.tree.command(name="검열단어확인", description="지금까지 등록한 스포일러 검열 단어 목록을 확인합니다. (관리자 전용)")
+@app_commands.default_permissions(administrator=True)
+async def show_censor_words(interaction: discord.Interaction):
+    await _show_words(interaction, "censor_words", "검열 단어", "🔒")
+
+
+# ---------- 단어 개별 삭제 (자동완성으로 목록에서 선택) ----------
+def _word_choices(interaction: discord.Interaction, key: str, current: str):
+    if not interaction.guild:
+        return []
+    words = GUILD_SETTINGS.get(interaction.guild.id, {}).get(key, [])
+    cur = current.lower()
+    return [
+        app_commands.Choice(name=w[:100], value=w)
+        for w in words if cur in w.lower() and len(w) <= 100
+    ][:25]
+
+async def _remove_word(interaction: discord.Interaction, key: str, label: str, word: str):
     guild_id = interaction.guild.id
-    if guild_id in GUILD_SETTINGS and "censor_words" in GUILD_SETTINGS[guild_id]:
-        GUILD_SETTINGS[guild_id]["censor_words"] = []
-        save_settings(GUILD_SETTINGS)
-        await interaction.response.send_message("🗑️ 모든 스포일러 검열 언어 목록이 초기화되었습니다.", ephemeral=True)
-    else:
-        await interaction.response.send_message("❌ 등록된 검열 언어 리스트가 없습니다.", ephemeral=True)
+    words = GUILD_SETTINGS.get(guild_id, {}).get(key, [])
+    if word not in words:
+        await interaction.response.send_message(f"❌ `{word}` 은(는) 등록된 {label}가 아닙니다. 목록에서 선택해 주세요.", ephemeral=True)
+        return
+    words.remove(word)
+    save_settings(GUILD_SETTINGS)
+    await interaction.response.send_message(f"🗑️ {label} `{word}` 이(가) 삭제되었습니다. (남은 단어: {len(words)}개)", ephemeral=True)
+
+@bot.tree.command(name="제재단어삭제", description="등록된 제재 단어 중 선택한 단어 하나만 삭제합니다. (관리자 전용)")
+@app_commands.describe(단어="삭제할 제재 단어를 목록에서 선택하세요.")
+@app_commands.default_permissions(administrator=True)
+async def remove_ban_word(interaction: discord.Interaction, 단어: str):
+    await _remove_word(interaction, "ban_words", "제재 단어", 단어)
+
+@remove_ban_word.autocomplete("단어")
+async def remove_ban_word_autocomplete(interaction: discord.Interaction, current: str):
+    return _word_choices(interaction, "ban_words", current)
+
+@bot.tree.command(name="검열단어삭제", description="등록된 검열 단어 중 선택한 단어 하나만 삭제합니다. (관리자 전용)")
+@app_commands.describe(단어="삭제할 검열 단어를 목록에서 선택하세요.")
+@app_commands.default_permissions(administrator=True)
+async def remove_censor_word(interaction: discord.Interaction, 단어: str):
+    await _remove_word(interaction, "censor_words", "검열 단어", 단어)
+
+@remove_censor_word.autocomplete("단어")
+async def remove_censor_word_autocomplete(interaction: discord.Interaction, current: str):
+    return _word_choices(interaction, "censor_words", current)
+
+
+# ================= [ 설정 현황 확인 커맨드 ] =================
+async def _show_channel_setting(interaction: discord.Interaction, key: str, label: str):
+    channel_id = GUILD_SETTINGS.get(interaction.guild.id, {}).get(key)
+    if not channel_id:
+        await interaction.response.send_message(f"❌ 설정된 {label}이(가) 없습니다.", ephemeral=True)
+        return
+    channel = interaction.guild.get_channel(channel_id)
+    channel_text = channel.mention if channel else "(삭제되었거나 접근할 수 없는 채널)"
+    await interaction.response.send_message(f"📌 **현재 {label}:** {channel_text}\n🆔 채널 ID: `{channel_id}`", ephemeral=True)
+
+@bot.tree.command(name="제재로그확인", description="설정된 제재 로그 채널과 ID를 확인합니다. (관리자 전용)")
+@app_commands.default_permissions(administrator=True)
+async def show_punish_log(interaction: discord.Interaction):
+    await _show_channel_setting(interaction, "punish_log_channel", "제재 로그 채널")
+
+@bot.tree.command(name="인증방확인", description="설정된 인증 채널과 ID를 확인합니다. (관리자 전용)")
+@app_commands.default_permissions(administrator=True)
+async def show_auth_channel(interaction: discord.Interaction):
+    await _show_channel_setting(interaction, "auth_channel", "인증 채널")
+
+@bot.tree.command(name="입장로그확인", description="설정된 입장 로그 채널과 ID를 확인합니다. (관리자 전용)")
+@app_commands.default_permissions(administrator=True)
+async def show_join_log(interaction: discord.Interaction):
+    await _show_channel_setting(interaction, "join_log_channel", "입장 로그 채널")
+
+@bot.tree.command(name="퇴장로그확인", description="설정된 퇴장 로그 채널과 ID를 확인합니다. (관리자 전용)")
+@app_commands.default_permissions(administrator=True)
+async def show_leave_log(interaction: discord.Interaction):
+    await _show_channel_setting(interaction, "leave_log_channel", "퇴장 로그 채널")
+
+@bot.tree.command(name="인증양식확인", description="등록된 인증 안내 양식 문구를 확인합니다. (관리자 전용)")
+@app_commands.default_permissions(administrator=True)
+async def show_auth_form(interaction: discord.Interaction):
+    form = GUILD_SETTINGS.get(interaction.guild.id, {}).get("auth_form")
+    if not form:
+        await interaction.response.send_message("❌ 등록된 인증 양식이 없습니다.", ephemeral=True)
+        return
+    preview = form.replace("\\n", "\n")
+    if len(preview) > 3900:
+        preview = preview[:3900] + "\n…(일부 생략)"
+    embed = discord.Embed(title="📝 등록된 인증 양식", description=preview, color=discord.Color.blue())
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 # ================= [ 🛠️ 유저 관리 및 가이드 명령어 파트 ] =================
@@ -660,19 +829,30 @@ async def clear_punish_slash(interaction: discord.Interaction, 멤버: discord.M
 async def send_system_guide(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=False)
 
-    guide_text = (
-        "• **/제재로그설정 `[#채널]`** : 유저 제재 및 전과 내역이 기록될 채널을 지정합니다.\n"
-        "• **/제재로그제거** : 시스템에 연결된 제재 채널 데이터를 완전 파기합니다.\n"
-        "• **/인증방설정 `[#채널]`** : 가입자가 최초 진입 시 인증 서식을 송출해 줄 타겟 채널을 셋업합니다.\n"
-        "• **/인증방제거** : 지정된 인증 채널 설정을 초기화합니다.\n"
-        "• **/입장로그설정 / /퇴장로그설정** : 입퇴장 유저 추적 데이터를 전송받을 로그 채널을 연동합니다.\n"
-        "• **/입장로그제거 / /퇴장로그제거** : 바인딩된 입퇴장 방 정보를 테이블에서 삭제합니다.\n"
-        "• **/인증지급 `[@역할]`** : 승인 완료 시 줄 기본 역할들을 등록합니다. (여러 번 입력 시 누적 추가)\n"
-        "• **/인증지급리셋** : 등록되어 있던 모든 기본 마스터 역할 목록을 비웁니다.\n"
-        "• **/인증양식 `[문구]`** : 신입 멤버 입장 즉시 안내할 질문지 양식을 저장합니다. (`\\n`으로 줄바꿈 가능)\n"
-        "• **/인증완료 `[@유저]` `[@추가역할]`** : 대상 유저에게 기본 역할들과 선택한 성별/특수 역할을 함께 지급합니다.\n"
-        "• **/자동제재언어설정 `[단어1, 단어2]`** : 제재할 언어들을 쉼표로 구분하여 여러 개 등록합니다.\n"
-        "• **/검열언어설정 `[단어1, 단어2]`** : 스포일러 처리할 언어들을 쉼표로 구분하여 여러 개 등록합니다."
+    setup_text = (
+        "• **/제재로그설정 `[#채널]`** / **/제재로그제거** / **/제재로그확인**\n"
+        "• **/인증방설정 `[#채널]`** / **/인증방제거** / **/인증방확인**\n"
+        "• **/입장로그설정** / **/입장로그제거** / **/입장로그확인**\n"
+        "• **/퇴장로그설정** / **/퇴장로그제거** / **/퇴장로그확인**\n"
+        "  └ 설정은 채널 지정, 제거는 설정 삭제, 확인은 현재 설정된 채널과 ID를 보여줍니다. (미설정 시 '없다'고 안내)"
+    )
+
+    auth_text = (
+        "• **/인증지급 `[@역할]`** : 승인 완료 시 줄 기본 역할을 등록합니다. (여러 번 입력 시 누적 추가)\n"
+        "• **/인증지급리셋** : 등록된 기본 역할 목록을 모두 비웁니다.\n"
+        "• **/인증양식 `[문구]`** : 신입 입장 시 안내할 양식을 저장합니다. (`\\n`으로 줄바꿈 가능)\n"
+        "• **/인증양식확인** : 저장된 인증 양식을 확인합니다.\n"
+        "• **/인증완료 `[@유저]` `[@추가역할]`** : 기본 역할과 선택한 성별/특수 역할을 함께 지급합니다."
+    )
+
+    word_text = (
+        "• **/제재단어설정 `[단어1, 단어2]`** : 포함 시 삭제 + 자동 제재(타임아웃·전과)할 단어를 등록합니다.\n"
+        "• **/제재단어확인** : 등록된 제재 단어 목록을 확인합니다.\n"
+        "• **/제재단어삭제 `[단어]`** : 목록에서 선택한 제재 단어 하나만 삭제합니다.\n"
+        "• **/검열단어설정 `[단어1, 단어2]`** : 포함 시 스포일러 처리할 단어를 등록합니다.\n"
+        "• **/검열단어확인** : 등록된 검열 단어 목록을 확인합니다.\n"
+        "• **/검열단어삭제 `[단어]`** : 목록에서 선택한 검열 단어 하나만 삭제합니다.\n"
+        "• **/제재단어초기화 / /검열단어초기화** : 해당 단어 목록 전체를 비웁니다. (경고 메시지의 ✅ 누르면 초기화, ❌ 누르면 취소)"
     )
 
     penalty_text = (
@@ -688,7 +868,9 @@ async def send_system_guide(interaction: discord.Interaction):
         color=discord.Color.purple(),
         timestamp=discord.utils.utcnow()
     )
-    embed.add_field(name="⚙️ 시스템 통합 명령어 구성표", value=guide_text, inline=False)
+    embed.add_field(name="⚙️ 채널 설정 명령어", value=setup_text, inline=False)
+    embed.add_field(name="✅ 인증 명령어", value=auth_text, inline=False)
+    embed.add_field(name="🚨 제재/검열 단어 명령어", value=word_text, inline=False)
     embed.add_field(name="🚨 채널/역할 설정 누락 시 생기는 관리자 불이익", value=penalty_text, inline=False)
     embed.set_footer(text="안전하고 청정한 서버 환경을 구축합니다 • Powered by NattoBot")
     
