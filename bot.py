@@ -104,7 +104,6 @@ async def punish_user(guild: discord.Guild, member: discord.Member, reason: str,
             embed.add_field(name="👤 대상자", value=f"{member.mention} ({member.name})", inline=True)
             embed.add_field(name="🔨 집행자", value=str(punisher), inline=True)
             embed.add_field(name="💬 최종 사유", value=reason[:1024], inline=False)
-            embed.set_footer(text="억울한 사항이 있다면 관리자에게 증거와 함께 자초지종을 DM으로 보내주세요")
             await send_log(embed=embed)
             return True
 
@@ -132,7 +131,6 @@ async def punish_user(guild: discord.Guild, member: discord.Member, reason: str,
         embed.add_field(name="🔨 집행자", value=str(punisher), inline=True)
         embed.add_field(name="📜 조치 내용", value=f"**{role_name}** 부여 및 **{punish_days}일간** 타임아웃", inline=False)
         embed.add_field(name="💬 제재 사유", value=reason[:1024], inline=False)
-        embed.set_footer(text="억울한 사항이 있다면 관리자에게 증거와 함께 자초지종을 DM으로 보내주세요")
         await send_log(embed=embed)
         return True
 
@@ -793,7 +791,7 @@ async def clear_punish_slash(interaction: discord.Interaction, 멤버: discord.M
                     continue
 
         if roles_to_remove:
-            await member.remove_roles(*roles_to_remove)
+            await 멤버.remove_roles(*roles_to_remove)
 
         next_count = max(0, current_count - 1)
         action_description = "대상자의 타임아웃 해제 및 전과 누적 단계를 전면 백지화(초기화)했습니다."
