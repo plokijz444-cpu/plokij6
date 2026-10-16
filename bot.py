@@ -7,6 +7,7 @@ from threading import Thread
 import os
 import json
 import tempfile
+import re
 from typing import Optional
 from discord import app_commands
 
@@ -70,6 +71,58 @@ def format_member_name(member: discord.Member) -> str:
     if server_nick == original_nick:
         return clean(server_nick)
     return f"{clean(server_nick)} ({clean(original_nick)})"
+
+# ================= [ 필수 설정 검사 및 멤버 검색 헬퍼 ] =================
+MAX_PUNISH_TARGETS = 10  # /제재 한 번에 제재 가능한 최대 인원
+
+async def require_setting_channel(interaction: discord.Interaction, key: str, label: str, setup_cmd: str, action: str) -> bool:
+    """필수 채널 설정이 없으면 안내 문구를 남기고 False를 반환합니다."""
+    guild = interaction.guild
+    channel_id = GUILD_SETTINGS.get(guild.id, {}).get(key)
+    if not channel_id:
+        await interaction.response.send_message(
+            f"⚠️ **{label}**이(가) 설정되어 있지 않아 {action}을(를) 실행할 수 없습니다.\n먼저 `{setup_cmd}` 명령어로 설정해 주세요.",
+            ephemeral=True
+        )
+        return False
+    if guild.get_channel(channel_id) is None:
+        await interaction.response.send_message(
+            f"⚠️ 설정된 **{label}**을(를) 찾을 수 없습니다. (채널이 삭제되었거나 봇이 볼 수 없는 채널입니다)\n`{setup_cmd}` 명령어로 다시 설정해 주세요.",
+            ephemeral=True
+        )
+        return False
+    return True
+
+def plain_member_label(member: discord.Member) -> str:
+    """자동완성 목록에 보여줄 '서버닉네임 (본닉네임)' (마크다운 이스케이프 없음)"""
+    server_nick = member.display_name
+    original_nick = member.global_name or member.name
+    return server_nick if server_nick == original_nick else f"{server_nick} ({original_nick})"
+
+async def resolve_member_token(guild: discord.Guild, token: str):
+    """입력 한 조각(멘션/ID/계정명/닉네임)을 멤버로 변환. (멤버, 실패사유)를 반환합니다."""
+    id_match = re.fullmatch(r"<@!?(\d+)>|(\d{15,25})", token)
+    if id_match:
+        member_id = int(id_match.group(1) or id_match.group(2))
+        member = guild.get_member(member_id)
+        if member is None:
+            try:
+                member = await guild.fetch_member(member_id)
+            except discord.HTTPException:
+                member = None
+        return (member, None) if member else (None, "유저 검색 실패")
+
+    name = token.lstrip("@").lower()
+    if not name:
+        return None, "유저 검색 실패"
+    matches = [m for m in guild.members if m.name.lower() == name]
+    if not matches:
+        matches = [m for m in guild.members if name in {m.display_name.lower(), (m.global_name or "").lower(), (m.nick or "").lower()}]
+    if len(matches) == 1:
+        return matches[0], None
+    if len(matches) > 1:
+        return None, f"동명이인 {len(matches)}명, 목록에서 선택하거나 ID로 입력"
+    return None, "유저 검색 실패"
 
 # ================= [ 공통 제재 및 전과 추가 로직 ] =================
 # 자동 제재와 수동 제재가 모두 이 함수를 통해 "타임아웃 + 전과 역할 부여"를 처리합니다.
@@ -681,6 +734,8 @@ async def show_auth_form(interaction: discord.Interaction):
 @app_commands.describe(유저="인증을 승인할 유저를 선택하세요.", 추가역할="성별(남자/여자)이나 추가로 얹어줄 특수 역할을 목록에서 선택하세요. (선택사항)")
 @app_commands.default_permissions(manage_roles=True)
 async def approve_user(interaction: discord.Interaction, 유저: discord.Member, 추가역할: discord.Role = None):
+    if not await require_setting_channel(interaction, "auth_channel", "인증방", "/인증방설정", "인증 승인"):
+        return
     await interaction.response.defer(ephemeral=True)
     guild = interaction.guild
 
@@ -725,27 +780,26 @@ async def approve_user(interaction: discord.Interaction, 유저: discord.Member,
     except discord.Forbidden:
         await interaction.followup.send("❌ 봇의 서열(역할 순위)이 타겟 유저 또는 지급 역할보다 낮아 처리에 실패했습니다.")
 
-@bot.tree.command(name="제재", description="멤버를 목록에서 선택해 수동 제재합니다. (최대 5명, 더 많으면 추가멤버 사용)")
+@bot.tree.command(name="제재", description=f"멤버 이름을 입력해 수동 제재합니다. 쉼표+스페이스(, )로 최대 {MAX_PUNISH_TARGETS}명까지 한 번에 가능")
 @app_commands.describe(
-    멤버1="제재할 멤버를 목록에서 검색하여 선택하세요.",
-    사유="제재 사유를 입력하세요.",
-    멤버2="(선택) 함께 제재할 멤버",
-    멤버3="(선택) 함께 제재할 멤버",
-    멤버4="(선택) 함께 제재할 멤버",
-    멤버5="(선택) 함께 제재할 멤버",
-    추가멤버="(선택) 6명 이상일 때 멘션이나 ID를 쉼표(,)로 구분해 입력하세요."
+    멤버들=f"쉼표+스페이스(, )로 구분해 여러 명 추가 (최대 {MAX_PUNISH_TARGETS}명) · 이름을 치면 멤버 목록이 뜹니다",
+    사유="제재 사유를 입력하세요."
 )
 @app_commands.default_permissions(moderate_members=True)
-async def manual_punish_slash(
-    interaction: discord.Interaction,
-    멤버1: discord.Member,
-    사유: str = "관리자 수동 제재",
-    멤버2: Optional[discord.Member] = None,
-    멤버3: Optional[discord.Member] = None,
-    멤버4: Optional[discord.Member] = None,
-    멤버5: Optional[discord.Member] = None,
-    추가멤버: Optional[str] = None
-):
+async def manual_punish_slash(interaction: discord.Interaction, 멤버들: str, 사유: str = "관리자 수동 제재"):
+    if not await require_setting_channel(interaction, "punish_log_channel", "제재 로그 채널", "/제재로그설정", "제재"):
+        return
+
+    tokens = [t.strip() for t in 멤버들.split(",") if t.strip()]
+    if not tokens:
+        await interaction.response.send_message("⚠️ 제재할 멤버를 입력해 주세요. (여러 명은 쉼표+스페이스 `, ` 로 구분)", ephemeral=True)
+        return
+    if len(tokens) > MAX_PUNISH_TARGETS:
+        await interaction.response.send_message(
+            f"⚠️ 한 번에 최대 **{MAX_PUNISH_TARGETS}명**까지만 제재할 수 있습니다. (입력한 인원: {len(tokens)}명)", ephemeral=True
+        )
+        return
+
     await interaction.response.defer(ephemeral=True)
     guild = interaction.guild
 
@@ -754,33 +808,13 @@ async def manual_punish_slash(
     failed_members = []
     success_members = []
 
-    def add_target(m: discord.Member):
-        if m.id not in seen_ids:
-            seen_ids.add(m.id)
-            targets.append(m)
-
-    for m in (멤버1, 멤버2, 멤버3, 멤버4, 멤버5):
-        if m:
-            add_target(m)
-
-    # 6명 이상일 때 쓰는 멘션/ID 직접 입력
-    if 추가멤버:
-        for item in [i.strip() for i in 추가멤버.split(",") if i.strip()]:
-            member = None
-            clean_id = item.strip("<@!>")
-            if clean_id.isdigit():
-                member = guild.get_member(int(clean_id))
-                if member is None:
-                    try:
-                        member = await guild.fetch_member(int(clean_id))
-                    except discord.HTTPException:
-                        member = None
-            if member is None:
-                member = discord.utils.get(guild.members, name=item)
-            if member:
-                add_target(member)
-            else:
-                failed_members.append(f"'{item}'(유저 검색 실패)")
+    for token in tokens:
+        member, reason = await resolve_member_token(guild, token)
+        if member is None:
+            failed_members.append(f"'{discord.utils.escape_markdown(token)}'({reason})")
+        elif member.id not in seen_ids:
+            seen_ids.add(member.id)
+            targets.append(member)
 
     for member in targets:
         display = format_member_name(member)
@@ -804,16 +838,57 @@ async def manual_punish_slash(
 
     await interaction.followup.send(status_msg)
 
+@manual_punish_slash.autocomplete("멤버들")
+async def manual_punish_autocomplete(interaction: discord.Interaction, current: str):
+    guild = interaction.guild
+    if not guild:
+        return []
+
+    # 마지막 쉼표 앞은 이미 고른 멤버, 뒤는 지금 검색 중인 이름
+    head, sep, tail = current.rpartition(",")
+    chosen = [t.strip() for t in head.split(",") if t.strip()] if sep else []
+    if len(chosen) >= MAX_PUNISH_TARGETS:
+        return []
+    prefix = (", ".join(chosen) + ", ") if chosen else ""
+    chosen_lower = {t.lstrip("@").lower() for t in chosen}
+    query = tail.strip().lstrip("@").lower()
+
+    scored = []
+    for m in guild.members:
+        if m.bot or m.name.lower() in chosen_lower:
+            continue
+        fields = [m.name.lower(), m.display_name.lower(), (m.global_name or "").lower()]
+        if query:
+            if any(f.startswith(query) for f in fields):
+                score = 0
+            elif any(query in f for f in fields):
+                score = 1
+            else:
+                continue
+        else:
+            score = 0
+        scored.append((score, m.display_name.lower(), m))
+    scored.sort(key=lambda x: (x[0], x[1]))
+
+    choices = []
+    for _, _, m in scored:
+        value = prefix + m.name
+        if len(value) > 100:  # Discord 자동완성 값 길이 제한
+            continue
+        choices.append(app_commands.Choice(name=plain_member_label(m)[:100], value=value))
+        if len(choices) >= 25:
+            break
+    return choices
+
 @bot.tree.command(name="제재지우기", description="멤버 목록에서 유저를 선택해 타임아웃을 풀고 전과 단계를 1범 감면합니다.")
 @app_commands.describe(멤버="제재 복구 대상 멤버를 목록에서 검색하여 선택하세요.")
 @app_commands.default_permissions(moderate_members=True)
 async def clear_punish_slash(interaction: discord.Interaction, 멤버: discord.Member):
+    if not await require_setting_channel(interaction, "punish_log_channel", "제재 로그 채널", "/제재로그설정", "제재 감면"):
+        return
+
     await interaction.response.defer(ephemeral=True)
     guild = interaction.guild
-
-    if guild.id not in GUILD_SETTINGS or "punish_log_channel" not in GUILD_SETTINGS[guild.id]:
-        await interaction.followup.send("❌ 시스템 설정에 제재 로그방 정보가 없습니다. `/제재로그설정`을 먼저 실행하세요.")
-        return
 
     log_channel_id = GUILD_SETTINGS[guild.id]["punish_log_channel"]
     log_channel = guild.get_channel(log_channel_id)
@@ -899,9 +974,9 @@ async def send_system_guide(interaction: discord.Interaction):
 
     penalty_text = (
         "1. **인증 시스템 마비 (Critical)**\n"
-        "   - `인증방설정`, `인증지급`, `인증메세지` 세 가지 중 하나라도 데이터가 누락되면 신입 유저가 유입되어도 **인증 메세지가 안 뜨거나 역할을 주지 못해 가입 단계가 완전히 멈추게 됩니다.**\n"
+        "   - `인증방설정`, `인증지급`, `인증메세지` 세 가지 중 하나라도 데이터가 누락되면 신입 유저가 유입되어도 **인증 메세지가 안 뜨거나 역할을 주지 못해 가입 단계가 완전히 멈추게 됩니다.** (`인증방설정`이 없으면 `/인증완료`도 실행되지 않습니다.)\n"
         "2. **보안 모니터링 블랙아웃 (Blackout)**\n"
-        "   - `제재로그설정` 또는 입퇴장 로그 셋업이 비어있을 경우, 봇이 내부적으로 제재 및 타임아웃 조치는 취하지만 **로그방에 아무런 기록(임베드)을 남기지 않아 관리망이 마비**됩니다."
+        "   - `제재로그설정`이 비어있으면 **`/제재`, `/제재지우기`를 사용할 수 없고**, 자동 제재는 처리되지만 **로그방에 기록(임베드)이 남지 않아 관리망이 마비**됩니다. 입퇴장 로그 셋업이 비어있으면 해당 로그가 기록되지 않습니다."
     )
 
     embed = discord.Embed(
