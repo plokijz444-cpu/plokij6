@@ -71,19 +71,26 @@ def format_member_name(member: discord.Member) -> str:
     return f"{clean(server_nick)} ({clean(original_nick)})"
 
 # ================= [ 필수 설정 검사 헬퍼 ] =================
+def josa(word: str, with_final: str, without_final: str) -> str:
+    """마지막 글자의 받침 유무에 따라 조사를 선택합니다. (예: 제재 → 를, 인증 승인 → 을)"""
+    last = word.strip()[-1:]
+    if "가" <= last <= "힣":
+        return with_final if (ord(last) - 0xAC00) % 28 != 0 else without_final
+    return without_final
+
 async def require_setting_channel(interaction: discord.Interaction, key: str, label: str, setup_cmd: str, action: str) -> bool:
     """필수 채널 설정이 없으면 안내 문구를 남기고 False를 반환합니다."""
     guild = interaction.guild
     channel_id = GUILD_SETTINGS.get(guild.id, {}).get(key)
     if not channel_id:
         await interaction.response.send_message(
-            f"⚠️ **{label}**이(가) 설정되어 있지 않아 {action}을(를) 실행할 수 없습니다.\n먼저 `{setup_cmd}` 명령어로 설정해 주세요.",
+            f"⚠️ **{label}**{josa(label, '이', '가')} 설정되어 있지 않아 {action}{josa(action, '을', '를')} 실행할 수 없습니다.\n먼저 `{setup_cmd}` 명령어로 설정해 주세요.",
             ephemeral=True
         )
         return False
     if guild.get_channel(channel_id) is None:
         await interaction.response.send_message(
-            f"⚠️ 설정된 **{label}**을(를) 찾을 수 없습니다. (채널이 삭제되었거나 봇이 볼 수 없는 채널입니다)\n`{setup_cmd}` 명령어로 다시 설정해 주세요.",
+            f"⚠️ 설정된 **{label}**{josa(label, '을', '를')} 찾을 수 없습니다. (채널이 삭제되었거나 봇이 볼 수 없는 채널입니다)\n`{setup_cmd}` 명령어로 다시 설정해 주세요.",
             ephemeral=True
         )
         return False
@@ -770,7 +777,7 @@ async def manual_punish_slash(interaction: discord.Interaction, 멤버: discord.
 @app_commands.describe(멤버="제재 복구 대상 멤버를 목록에서 검색하여 선택하세요.")
 @app_commands.default_permissions(moderate_members=True)
 async def clear_punish_slash(interaction: discord.Interaction, 멤버: discord.Member):
-    if not await require_setting_channel(interaction, "punish_log_channel", "제재 로그 채널", "/제재로그설정", "제재 감면"):
+    if not await require_setting_channel(interaction, "punish_log_channel", "제재 로그 채널", "/제재로그설정", "제재지우기"):
         return
 
     await interaction.response.defer(ephemeral=True)
