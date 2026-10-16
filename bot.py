@@ -434,16 +434,46 @@ async def set_auth_role(interaction: discord.Interaction, 역할: discord.Role):
     else:
         await interaction.response.send_message(f"⚠️ **{역할.name}**은(는) 이미 기본 역할 목록에 등록되어 있습니다.", ephemeral=True)
 
-@bot.tree.command(name="인증지급리셋", description="등록되어 있던 모든 기본 마스터 역할 목록을 초기화합니다. (관리자 전용)")
+@bot.tree.command(name="인증지급초기화", description="인증지급으로 등록된 모든 기본 역할을 초기화합니다. ✅/❌ 반응으로 한 번 더 확인합니다. (관리자 전용)")
 @app_commands.default_permissions(administrator=True)
 async def reset_auth_roles(interaction: discord.Interaction):
-    guild_id = interaction.guild.id
-    if guild_id in GUILD_SETTINGS and "auth_role_ids" in GUILD_SETTINGS[guild_id]:
-        GUILD_SETTINGS[guild_id]["auth_role_ids"] = []
-        save_settings(GUILD_SETTINGS)
-        await interaction.response.send_message("🗑️ 등록된 모든 기본 마스터 역할 리스트가 청소되었습니다.", ephemeral=True)
-    else:
-        await interaction.response.send_message("❌ 등록된 역할 목록이 존재하지 않습니다.", ephemeral=True)
+    await _confirm_and_reset_words(interaction, "auth_role_ids", "인증지급 역할")
+
+@bot.tree.command(name="인증지급제거", description="인증지급으로 등록된 역할 중 선택한 역할 하나만 제외합니다. (관리자 전용)")
+@app_commands.describe(역할="인증지급에서 제외할 역할을 목록에서 선택하세요.")
+@app_commands.default_permissions(administrator=True)
+async def remove_auth_role(interaction: discord.Interaction, 역할: str):
+    guild = interaction.guild
+    role_ids = GUILD_SETTINGS.get(guild.id, {}).get("auth_role_ids", [])
+    if not role_ids:
+        await interaction.response.send_message("❌ 인증지급에 등록된 역할이 없습니다.", ephemeral=True)
+        return
+    if not 역할.isdigit() or int(역할) not in role_ids:
+        await interaction.response.send_message("❌ 선택한 역할은 인증지급에 등록되어 있지 않습니다. 목록에서 선택해 주세요.", ephemeral=True)
+        return
+
+    role_id = int(역할)
+    role_ids.remove(role_id)
+    save_settings(GUILD_SETTINGS)
+
+    role = guild.get_role(role_id)
+    role_name = discord.utils.escape_mentions(discord.utils.escape_markdown(role.name)) if role else f"삭제된 역할({role_id})"
+    await interaction.response.send_message(f"🗑️ **{role_name}** 역할이 인증지급에서 제외되었습니다. (남은 역할: {len(role_ids)}개)", ephemeral=True)
+
+@remove_auth_role.autocomplete("역할")
+async def remove_auth_role_autocomplete(interaction: discord.Interaction, current: str):
+    guild = interaction.guild
+    if not guild:
+        return []
+    cur = current.lower()
+    choices = []
+    for role_id in GUILD_SETTINGS.get(guild.id, {}).get("auth_role_ids", []):
+        role = guild.get_role(role_id)
+        label = role.name if role else f"(삭제된 역할) {role_id}"
+        if cur and cur not in label.lower():
+            continue
+        choices.append(app_commands.Choice(name=label[:100], value=str(role_id)))
+    return choices[:25]
 
 @bot.tree.command(name="인증메세지", description="유저가 입장할 때 자동으로 보낼 인증 안내 메세지를 등록합니다. (관리자 전용)")
 @app_commands.describe(메세지="인증방에 출력할 문구를 작성하세요. (줄바꿈은 \n 문자를 사용하세요)")
@@ -490,7 +520,7 @@ async def _confirm_and_reset_words(interaction: discord.Interaction, key: str, l
     guild_id = interaction.guild.id
     words = GUILD_SETTINGS.get(guild_id, {}).get(key, [])
     if not words:
-        await interaction.response.send_message(f"❌ 등록된 {label}가 없어 초기화할 내용이 없습니다.", ephemeral=True)
+        await interaction.response.send_message(f"❌ 등록된 {label}{josa(label, '이', '가')} 없어 초기화할 내용이 없습니다.", ephemeral=True)
         return
 
     warn_text = (
@@ -549,7 +579,7 @@ async def _confirm_and_reset_words(interaction: discord.Interaction, key: str, l
         except discord.HTTPException:
             pass
     else:
-        await notice(f"🚫 {interaction.user.mention} {label} 초기화가 거절(취소)되었습니다. 기존 단어는 그대로 유지됩니다.")
+        await notice(f"🚫 {interaction.user.mention} {label} 초기화가 거절(취소)되었습니다. 기존 설정은 그대로 유지됩니다.")
 
 @bot.tree.command(name="제재단어초기화", description="등록된 모든 자동 제재 단어를 초기화합니다. ✅/❌ 반응으로 한 번 더 확인합니다. (관리자 전용)")
 @app_commands.default_permissions(administrator=True)
@@ -773,6 +803,55 @@ async def manual_punish_slash(interaction: discord.Interaction, 멤버: discord.
     else:
         await interaction.followup.send(f"❌ **제재 실패:** {display}(제재 실행 실패)")
 
+@bot.tree.command(name="추방", description="멤버 목록에서 유저를 선택하고 사유를 적어 서버에서 추방합니다.")
+@app_commands.describe(멤버="추방할 멤버를 목록에서 검색하여 선택하세요.", 사유="추방 사유를 입력하세요. (감사 로그와 제재 로그에 기록됩니다)")
+@app_commands.default_permissions(kick_members=True)
+async def kick_member_slash(interaction: discord.Interaction, 멤버: discord.Member, 사유: str = "관리자 수동 추방"):
+    await interaction.response.defer(ephemeral=True)
+    guild = interaction.guild
+    display = format_member_name(멤버)
+
+    if 멤버.id == interaction.user.id:
+        await interaction.followup.send("❌ 자기 자신은 추방할 수 없습니다.")
+        return
+    if 멤버.id == guild.me.id:
+        await interaction.followup.send("❌ 봇 자신은 추방할 수 없습니다.")
+        return
+    if 멤버.id == guild.owner_id:
+        await interaction.followup.send("❌ 서버 소유자는 추방할 수 없습니다.")
+        return
+    if 멤버.top_role >= guild.me.top_role:
+        await interaction.followup.send(f"❌ **추방 실패:** {display}\n봇의 역할 순위가 대상보다 낮거나 같습니다. 서버 설정에서 봇 역할을 위로 올려주세요.")
+        return
+    if interaction.user.id != guild.owner_id and 멤버.top_role >= interaction.user.top_role:
+        await interaction.followup.send("❌ 자신과 같거나 더 높은 역할을 가진 멤버는 추방할 수 없습니다.")
+        return
+
+    try:
+        await 멤버.kick(reason=f"{사유} (집행자: {interaction.user.name})"[:512])
+    except discord.Forbidden:
+        await interaction.followup.send(f"❌ **추방 실패:** {display}\n봇에게 '멤버 추방하기' 권한이 없거나 역할 순위가 부족합니다.")
+        return
+    except discord.HTTPException as e:
+        await interaction.followup.send(f"❌ **추방 실패:** {display}\n`{e}`")
+        return
+
+    safe_reason = discord.utils.escape_mentions(사유)
+    await interaction.followup.send(f"✅ **추방 완료:** {display}\n📝 **사유:** {safe_reason}")
+
+    # 제재 로그 채널이 설정되어 있으면 기록을 남김 (설정이 없어도 추방은 정상 처리)
+    log_channel_id = GUILD_SETTINGS.get(guild.id, {}).get("punish_log_channel")
+    log_channel = guild.get_channel(log_channel_id) if log_channel_id else None
+    if log_channel:
+        embed = discord.Embed(title="👢 유저 추방 알림", color=discord.Color.red(), timestamp=discord.utils.utcnow())
+        embed.add_field(name="👤 대상자", value=f"{멤버.mention} ({멤버.name})", inline=True)
+        embed.add_field(name="🔨 집행자", value=str(interaction.user.name), inline=True)
+        embed.add_field(name="💬 추방 사유", value=safe_reason[:1024], inline=False)
+        try:
+            await log_channel.send(embed=embed)
+        except discord.HTTPException:
+            pass
+
 @bot.tree.command(name="제재지우기", description="멤버 목록에서 유저를 선택해 타임아웃을 풀고 전과 단계를 1범 감면합니다.")
 @app_commands.describe(멤버="제재 복구 대상 멤버를 목록에서 검색하여 선택하세요.")
 @app_commands.default_permissions(moderate_members=True)
@@ -849,7 +928,8 @@ async def send_system_guide(interaction: discord.Interaction):
 
     auth_text = (
         "• **/인증지급 `[@역할]`** : 승인 완료 시 줄 기본 역할을 등록합니다. (여러 번 입력 시 누적 추가)\n"
-        "• **/인증지급리셋** : 등록된 기본 역할 목록을 모두 비웁니다.\n"
+        "• **/인증지급초기화** : 등록된 기본 역할을 모두 비웁니다. (경고 메시지의 ✅ 누르면 초기화, ❌ 누르면 취소)\n"
+        "• **/인증지급제거** : 등록된 역할 중 선택한 역할 하나만 제외합니다.\n"
         "• **/인증메세지 `[문구]`** : 신입 입장 시 안내할 메세지를 저장합니다. (`\\n`으로 줄바꿈 가능)\n"
         "• **/인증메세지확인** : 저장된 인증 메세지를 확인합니다.\n"
         "• **/인증완료 `[@유저]` `[@추가역할]`** : 기본 역할과 선택한 성별/특수 역할을 함께 지급합니다."
