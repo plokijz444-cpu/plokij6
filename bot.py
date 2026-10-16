@@ -7,6 +7,7 @@ from threading import Thread
 import os
 import json
 import tempfile
+from typing import Optional
 from discord import app_commands
 
 # ================= [ Render 24시간 가동을 위한 웹서버 ] =================
@@ -57,6 +58,18 @@ intents.message_content = True
 intents.members = True          
 
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+# ================= [ 멤버 표시 이름 헬퍼 ] =================
+# 서버 닉네임을 적고, 괄호 안에 본 닉네임(디스코드 표시 이름, 없으면 계정 ID명)을 적습니다.
+# 서버 닉네임이 따로 없어 두 이름이 같으면 중복 표기 없이 한 번만 적습니다.
+def format_member_name(member: discord.Member) -> str:
+    server_nick = member.display_name
+    original_nick = member.global_name or member.name
+    def clean(text: str) -> str:
+        return discord.utils.escape_mentions(discord.utils.escape_markdown(text))
+    if server_nick == original_nick:
+        return clean(server_nick)
+    return f"{clean(server_nick)} ({clean(original_nick)})"
 
 # ================= [ 공통 제재 및 전과 추가 로직 ] =================
 # 자동 제재와 수동 제재가 모두 이 함수를 통해 "타임아웃 + 전과 역할 부여"를 처리합니다.
@@ -171,7 +184,7 @@ async def on_guild_join(guild: discord.Guild):
                     color=discord.Color.blue()
                 )
                 
-                guide_value = "• `/인증방설정 채널:[#채널]`\n• `/제재로그설정 채널:[#채널]`\n• `/인증지급 역할:[@역할]` (여러 개 등록 가능)\n• `/인증양식 양식:[텍스트]`\n\n자세한 사용법은 채팅창에 **`/가이드`**를 입력하여 확인하세요!"
+                guide_value = "• `/인증방설정 채널:[#채널]`\n• `/제재로그설정 채널:[#채널]`\n• `/인증지급 역할:[@역할]` (여러 개 등록 가능)\n• `/인증메세지 메세지:[텍스트]`\n\n자세한 사용법은 채팅창에 **`/가이드`**를 입력하여 확인하세요!"
 
                 embed.add_field(
                     name="📌 초기 필수 명령어 목록",
@@ -407,15 +420,15 @@ async def reset_auth_roles(interaction: discord.Interaction):
     else:
         await interaction.response.send_message("❌ 등록된 역할 목록이 존재하지 않습니다.", ephemeral=True)
 
-@bot.tree.command(name="인증양식", description="유저가 입장할 때 자동으로 보낼 가이드 안내 양식 문구를 등록합니다. (관리자 전용)")
-@app_commands.describe(양식="인증방에 출력할 문구를 작성하세요. (줄바꿈은 \n 문자를 사용하세요)")
+@bot.tree.command(name="인증메세지", description="유저가 입장할 때 자동으로 보낼 인증 안내 메세지를 등록합니다. (관리자 전용)")
+@app_commands.describe(메세지="인증방에 출력할 문구를 작성하세요. (줄바꿈은 \n 문자를 사용하세요)")
 @app_commands.default_permissions(administrator=True)
-async def set_auth_form(interaction: discord.Interaction, 양식: str):
+async def set_auth_form(interaction: discord.Interaction, 메세지: str):
     guild_id = interaction.guild.id
     if guild_id not in GUILD_SETTINGS: GUILD_SETTINGS[guild_id] = {}
-    GUILD_SETTINGS[guild_id]["auth_form"] = 양식
+    GUILD_SETTINGS[guild_id]["auth_form"] = 메세지
     save_settings(GUILD_SETTINGS)
-    await interaction.response.send_message("✅ 인증 가이드 및 양식 문장 정상 보관되었습니다.", ephemeral=True)
+    await interaction.response.send_message("✅ 인증 안내 메세지가 정상적으로 저장되었습니다.", ephemeral=True)
 
 
 # ================= [ 제재/검열 단어 설정 · 확인 · 삭제 커맨드 ] =================
@@ -648,17 +661,17 @@ async def show_join_log(interaction: discord.Interaction):
 async def show_leave_log(interaction: discord.Interaction):
     await _show_channel_setting(interaction, "leave_log_channel", "퇴장 로그 채널")
 
-@bot.tree.command(name="인증양식확인", description="등록된 인증 안내 양식 문구를 확인합니다. (관리자 전용)")
+@bot.tree.command(name="인증메세지확인", description="등록된 인증 안내 메세지를 확인합니다. (관리자 전용)")
 @app_commands.default_permissions(administrator=True)
 async def show_auth_form(interaction: discord.Interaction):
     form = GUILD_SETTINGS.get(interaction.guild.id, {}).get("auth_form")
     if not form:
-        await interaction.response.send_message("❌ 등록된 인증 양식이 없습니다.", ephemeral=True)
+        await interaction.response.send_message("❌ 등록된 인증 메세지가 없습니다.", ephemeral=True)
         return
     preview = form.replace("\\n", "\n")
     if len(preview) > 3900:
         preview = preview[:3900] + "\n…(일부 생략)"
-    embed = discord.Embed(title="📝 등록된 인증 양식", description=preview, color=discord.Color.blue())
+    embed = discord.Embed(title="📝 등록된 인증 메세지", description=preview, color=discord.Color.blue())
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
@@ -712,43 +725,74 @@ async def approve_user(interaction: discord.Interaction, 유저: discord.Member,
     except discord.Forbidden:
         await interaction.followup.send("❌ 봇의 서열(역할 순위)이 타겟 유저 또는 지급 역할보다 낮아 처리에 실패했습니다.")
 
-@bot.tree.command(name="제재", description="여러 멤버의 멘션이나 ID를 쉼표(,)로 구분하여 한 번에 수동 제재합니다.")
-@app_commands.describe(멤버들="제재 대상 멤버들을 멘션하거나 ID를 적어주세요. 쉼표(,)로 여러 명 입력 가능합니다.", 사유="제재 사유를 입력하세요.")
+@bot.tree.command(name="제재", description="멤버를 목록에서 선택해 수동 제재합니다. (최대 5명, 더 많으면 추가멤버 사용)")
+@app_commands.describe(
+    멤버1="제재할 멤버를 목록에서 검색하여 선택하세요.",
+    사유="제재 사유를 입력하세요.",
+    멤버2="(선택) 함께 제재할 멤버",
+    멤버3="(선택) 함께 제재할 멤버",
+    멤버4="(선택) 함께 제재할 멤버",
+    멤버5="(선택) 함께 제재할 멤버",
+    추가멤버="(선택) 6명 이상일 때 멘션이나 ID를 쉼표(,)로 구분해 입력하세요."
+)
 @app_commands.default_permissions(moderate_members=True)
-async def manual_punish_slash(interaction: discord.Interaction, 멤버들: str, 사유: str = "관리자 수동 제재"):
+async def manual_punish_slash(
+    interaction: discord.Interaction,
+    멤버1: discord.Member,
+    사유: str = "관리자 수동 제재",
+    멤버2: Optional[discord.Member] = None,
+    멤버3: Optional[discord.Member] = None,
+    멤버4: Optional[discord.Member] = None,
+    멤버5: Optional[discord.Member] = None,
+    추가멤버: Optional[str] = None
+):
     await interaction.response.defer(ephemeral=True)
-    
-    raw_inputs = [i.strip() for i in 멤버들.split(",") if i.strip()]
-    
-    success_members = []
-    failed_members = []
-    
-    for item in raw_inputs:
-        member = None
-        if item.startswith("<@") and item.endswith(">"):
-            clean_id = item.replace("<@", "").replace(">", "").replace("!", "")
-            try:
-                member = interaction.guild.get_member(int(clean_id))
-            except ValueError:
-                pass
-        elif item.isdigit():
-            member = interaction.guild.get_member(int(item))
-            
-        if not member:
-            member = discord.utils.get(interaction.guild.members, name=item)
+    guild = interaction.guild
 
-        if member:
-            if member.top_role >= interaction.guild.me.top_role:
-                failed_members.append(f"{member.name}(서열 서치 불가)")
-                continue
-                
-            ok = await punish_user(interaction.guild, member, 사유, str(interaction.user.name))
-            if ok:
-                success_members.append(member.name)
+    targets = []
+    seen_ids = set()
+    failed_members = []
+    success_members = []
+
+    def add_target(m: discord.Member):
+        if m.id not in seen_ids:
+            seen_ids.add(m.id)
+            targets.append(m)
+
+    for m in (멤버1, 멤버2, 멤버3, 멤버4, 멤버5):
+        if m:
+            add_target(m)
+
+    # 6명 이상일 때 쓰는 멘션/ID 직접 입력
+    if 추가멤버:
+        for item in [i.strip() for i in 추가멤버.split(",") if i.strip()]:
+            member = None
+            clean_id = item.strip("<@!>")
+            if clean_id.isdigit():
+                member = guild.get_member(int(clean_id))
+                if member is None:
+                    try:
+                        member = await guild.fetch_member(int(clean_id))
+                    except discord.HTTPException:
+                        member = None
+            if member is None:
+                member = discord.utils.get(guild.members, name=item)
+            if member:
+                add_target(member)
             else:
-                failed_members.append(f"{member.name}(제재 실행 실패)")
+                failed_members.append(f"'{item}'(유저 검색 실패)")
+
+    for member in targets:
+        display = format_member_name(member)
+        if member.top_role >= guild.me.top_role:
+            failed_members.append(f"{display}(서열 서치 불가)")
+            continue
+
+        ok = await punish_user(guild, member, 사유, str(interaction.user.name))
+        if ok:
+            success_members.append(display)
         else:
-            failed_members.append(f"'{item}'(유저 검색 실패)")
+            failed_members.append(f"{display}(제재 실행 실패)")
 
     status_msg = ""
     if success_members:
@@ -794,7 +838,7 @@ async def clear_punish_slash(interaction: discord.Interaction, 멤버: discord.M
             await 멤버.remove_roles(*roles_to_remove)
 
         next_count = max(0, current_count - 1)
-        action_description = "대상자의 타임아웃 해제 및 전과 누적 단계를 전면 백지화(초기화)했습니다."
+        action_description = "대상자의 타임아웃 해제 및 전과 누적 단계를 초기화했습니다."
 
         if next_count > 0:
             new_role_name = f"전과 {next_count}범"
@@ -817,7 +861,7 @@ async def clear_punish_slash(interaction: discord.Interaction, 멤버: discord.M
             embed.description = action_description
             await log_channel.send(embed=embed)
 
-        await interaction.followup.send(f"🔓 {멤버.name} 유저의 제재 스택 감면 집행을 완료했습니다.")
+        await interaction.followup.send(f"🔓 {format_member_name(멤버)} 유저의 제재 스택 감면 집행을 완료했습니다.")
     except discord.Forbidden:
         await interaction.followup.send("❌ 봇의 권한 등급(서열)이 멤버 권한보다 낮아 조치를 거부당했습니다.")
     except Exception as e:
@@ -838,8 +882,8 @@ async def send_system_guide(interaction: discord.Interaction):
     auth_text = (
         "• **/인증지급 `[@역할]`** : 승인 완료 시 줄 기본 역할을 등록합니다. (여러 번 입력 시 누적 추가)\n"
         "• **/인증지급리셋** : 등록된 기본 역할 목록을 모두 비웁니다.\n"
-        "• **/인증양식 `[문구]`** : 신입 입장 시 안내할 양식을 저장합니다. (`\\n`으로 줄바꿈 가능)\n"
-        "• **/인증양식확인** : 저장된 인증 양식을 확인합니다.\n"
+        "• **/인증메세지 `[문구]`** : 신입 입장 시 안내할 메세지를 저장합니다. (`\\n`으로 줄바꿈 가능)\n"
+        "• **/인증메세지확인** : 저장된 인증 메세지를 확인합니다.\n"
         "• **/인증완료 `[@유저]` `[@추가역할]`** : 기본 역할과 선택한 성별/특수 역할을 함께 지급합니다."
     )
 
@@ -855,7 +899,7 @@ async def send_system_guide(interaction: discord.Interaction):
 
     penalty_text = (
         "1. **인증 시스템 마비 (Critical)**\n"
-        "   - `인증방설정`, `인증지급`, `인증양식` 세 가지 중 하나라도 데이터가 누락되면 신입 유저가 유입되어도 **인증 양식이 안 뜨거나 역할을 주지 못해 가입 단계가 완전히 멈추게 됩니다.**\n"
+        "   - `인증방설정`, `인증지급`, `인증메세지` 세 가지 중 하나라도 데이터가 누락되면 신입 유저가 유입되어도 **인증 메세지가 안 뜨거나 역할을 주지 못해 가입 단계가 완전히 멈추게 됩니다.**\n"
         "2. **보안 모니터링 블랙아웃 (Blackout)**\n"
         "   - `제재로그설정` 또는 입퇴장 로그 셋업이 비어있을 경우, 봇이 내부적으로 제재 및 타임아웃 조치는 취하지만 **로그방에 아무런 기록(임베드)을 남기지 않아 관리망이 마비**됩니다."
     )
