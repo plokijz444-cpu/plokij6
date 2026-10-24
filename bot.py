@@ -30,7 +30,7 @@ def keep_alive():
 # Render 등에서 Persistent Disk를 쓰면 DATA_DIR 환경변수에 마운트 경로(예: /data)를 넣어 주세요.
 DATA_DIR = os.getenv("DATA_DIR", ".")
 DATA_FILE = os.path.join(DATA_DIR, "guild_settings.json")
-COMMAND_VERSION = 2   # 전역 명령어 구성이 바뀔 때만 올리면 시작 시 1회 동기화됩니다.
+COMMAND_VERSION = 3   # 전역 명령어 구성이 바뀔 때만 올리면 시작 시 1회 동기화됩니다.
 META = {}
 
 def load_settings():
@@ -111,10 +111,10 @@ admin_only = app_commands.checks.has_permissions(administrator=True)
 
 def setup_hint(guild_id: int, key: str) -> str:
     f = FEATURES[key]
-    setup = f"`/설정 {f['cat']} {key}`"
+    setup = f"`/설정 『{f['cat']}』 {key}`"
     if is_on(guild_id, key):
         return f"먼저 {setup} 명령어로 설정해 주세요."
-    return f"먼저 `/활성화 {f['cat']} {key}` 로 활성화한 뒤 {setup} 명령어로 설정해 주세요."
+    return f"먼저 `/활성화 『{f['cat']}』 {key}` 로 활성화한 뒤 {setup} 명령어로 설정해 주세요."
 
 async def require_setting_channel(interaction: discord.Interaction, key: str, action: str) -> bool:
     """필수 채널 설정이 없으면 안내 문구를 남기고 False를 반환합니다."""
@@ -1122,12 +1122,12 @@ def build_guide_embed(guild_id: int, page: str) -> discord.Embed:
         embed.description = "필요한 기능만 골라 켜서 쓰는 방식이에요. 딱 3단계면 끝!"
         embed.add_field(name="1️⃣ 기능 켜기", value="`/활성화` → 카테고리 → 기능 선택 → Enter\n카테고리의 `전체`를 고르면 한 번에 켤 수 있어요.", inline=False)
         embed.add_field(name="2️⃣ 값 설정하기", value="`/설정` → 카테고리 → 기능 → 값 입력\n예) `/설정 인증 인증지급 역할:@멤버`", inline=False)
-        embed.add_field(name="3️⃣ 관리하기", value="`/체크` 확인 · `/제거` 일부 삭제 · `/초기화` 전체 비우기\n기능을 끄려면 `/비활성화`", inline=False)
+        embed.add_field(name="3️⃣ 관리하기", value="`/체크` 확인 · `/제거` 일부 삭제 · `/초기화` 전체 비우기\n기능을 끄려면 `/비활성화`, 전체 활성화는 `/모두활성화`, 전체 끄기는 `/모두비활성화`", inline=False)
         lines = []
         for cat, (emoji, _) in CATEGORIES.items():
             keys = [k for k, f in FEATURES.items() if f["cat"] == cat]
             on = sum(1 for k in keys if k in enabled)
-            lines.append(f"{emoji} **{cat}** `{'▰' * on}{'▱' * (len(keys) - on)}` {on}/{len(keys)}")
+            lines.append(f"{emoji} **『{cat}』** `{'▰' * on}{'▱' * (len(keys) - on)}` {on}/{len(keys)}")
         embed.add_field(name="📊 현재 활성화 현황", value="\n".join(lines), inline=False)
         embed.set_author(name="아래 메뉴에서 카테고리를 골라 자세히 보세요 👇")
         return embed
@@ -1143,7 +1143,7 @@ def build_guide_embed(guild_id: int, page: str) -> discord.Embed:
         return embed
 
     emoji, desc = CATEGORIES[page]
-    embed.title = f"{emoji} {page} 카테고리"
+    embed.title = f"{emoji} 『{page}』 카테고리"
     embed.description = desc
     for k, f in FEATURES.items():
         if f["cat"] != page:
@@ -1313,7 +1313,7 @@ def available_cmds(key: str) -> list:
         return [f"/{key}"]
     out = []
     if "set" in f:
-        out.append(f"/설정 {f['cat']} {key}")
+        out.append(f"/설정 『{f['cat']}』 {key}")
     if "check" in f:
         out.append(f"/체크 {key}")
     if "remove" in f:
@@ -1346,12 +1346,12 @@ def get_lock(guild_id: int) -> asyncio.Lock:
 async def feature_autocomplete(interaction: discord.Interaction, current: str):
     enabled = enabled_keys(interaction.guild.id) if interaction.guild else set()
     cur = current.lower()
-    return [app_commands.Choice(name=f"{FEATURES[k]['cat']} · {k}"[:100], value=k)
+    return [app_commands.Choice(name=f"『{FEATURES[k]['cat']}』 · {k}"[:100], value=k)
             for k in FEATURES if k in enabled and cur in k.lower()][:25]
 
 async def all_feature_autocomplete(interaction: discord.Interaction, current: str):
     cur = current.lower()
-    return [app_commands.Choice(name=f"{FEATURES[k]['cat']} · {k}"[:100], value=k)
+    return [app_commands.Choice(name=f"『{FEATURES[k]['cat']}』 · {k}"[:100], value=k)
             for k in FEATURES if cur in k.lower()][:25]
 
 @app_commands.describe(기능="설정할 기능을 선택하세요.", 값="채널은 #채널/ID, 역할은 @역할/ID, 문구나 단어는 내용을 입력하세요.")
@@ -1464,16 +1464,51 @@ async def give_role_cb(interaction: discord.Interaction, 대상: discord.Member,
     except discord.Forbidden:
         await interaction.response.send_message("❌ 봇의 역할 순위 또는 권한이 부족합니다.", ephemeral=True)
 
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@admin_only
+async def activate_all_cb(interaction: discord.Interaction):
+    await activate_features(interaction, list(FEATURES.keys()))
+
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@admin_only
+async def deactivate_all_cb(interaction: discord.Interaction):
+    guild = interaction.guild
+    await interaction.response.defer(ephemeral=True)
+    async with get_lock(guild.id):
+        gs = get_gs(guild.id)
+        old = list(gs.get("enabled", []))
+        if not old:
+            await interaction.followup.send("⚠️ 현재 활성화된 기능이 없습니다.")
+            return
+        gs["enabled"] = []
+        save_settings(GUILD_SETTINGS)
+        try:
+            await refresh_guild_commands(guild)
+        except discord.HTTPException as e:
+            gs["enabled"] = old
+            save_settings(GUILD_SETTINGS)
+            register_guild_commands(guild.id)
+            await interaction.followup.send(f"❌ 명령어 갱신에 실패했습니다. 잠시 후 다시 시도해 주세요.\\n`{e}`")
+            return
+    await interaction.followup.send(f"⛔ 전체 기능 {len(old)}개를 비활성화했습니다. 저장된 설정값은 유지됩니다.")
+
 def build_guild_commands(guild_id: int) -> list:
     enabled = enabled_keys(guild_id)
     if not enabled:
-        return []
+        return [
+            app_commands.Command(name="모두활성화", description="모든 기능을 한 번에 활성화합니다.", callback=activate_all_cb),
+            app_commands.Command(name="모두비활성화", description="모든 기능을 한 번에 비활성화합니다.", callback=deactivate_all_cb),
+        ]
     result = [
         app_commands.Command(name="설정", description="기능을 선택해 값을 설정합니다.", callback=generic_set_cb),
         app_commands.Command(name="체크", description="기능의 현재 설정을 확인합니다.", callback=generic_check_cb),
         app_commands.Command(name="제거", description="기능의 설정 또는 목록 항목을 제거합니다.", callback=generic_remove_cb),
         app_commands.Command(name="초기화", description="기능의 목록을 초기화합니다.", callback=generic_reset_cb),
-        app_commands.Command(name="비활성화", description="켜 둔 기능을 끕니다.", callback=deactivate_cb),
+        app_commands.Command(name="비활성화", description="켜 둔 기능 하나를 끕니다.", callback=deactivate_cb),
+        app_commands.Command(name="모두활성화", description="모든 기능을 한 번에 활성화합니다.", callback=activate_all_cb),
+        app_commands.Command(name="모두비활성화", description="모든 기능을 한 번에 비활성화합니다.", callback=deactivate_all_cb),
         app_commands.Command(name="역할주기", description="선택한 멤버에게 역할을 지급합니다.", callback=give_role_cb),
     ]
     for k, f in FEATURES.items():
@@ -1498,7 +1533,7 @@ def activation_embed(keys: list) -> discord.Embed:
     for k in keys:
         f = FEATURES[k]
         cmds = " · ".join(f"`{c}`" for c in available_cmds(k))
-        embed.add_field(name=f"{CATEGORIES[f['cat']][0]} {k}", value=f"{f['desc']}\n└ {cmds}", inline=False)
+        embed.add_field(name=f"{CATEGORIES[f['cat']][0]} 『{f['cat']}』 · {k}", value=f"{f['desc']}\n└ {cmds}", inline=False)
     embed.set_footer(text="명령어가 안 보이면 몇 초 기다렸다가 디스코드를 Ctrl+R 로 새로고침해 보세요.")
     return embed
 
@@ -1537,7 +1572,7 @@ async def deactivate_autocomplete(interaction: discord.Interaction, current: str
     choices = []
     for k in FEATURES:
         if k in enabled_keys(interaction.guild.id) and cur in k.lower():
-            choices.append(app_commands.Choice(name=f"{FEATURES[k]['cat']} · {k}", value=k))
+            choices.append(app_commands.Choice(name=f"『{FEATURES[k]['cat']}』 · {k}", value=k))
     return choices[:25]
 
 @app_commands.describe(기능="비활성화할 기능을 목록에서 선택하세요.")
