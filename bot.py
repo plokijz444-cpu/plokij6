@@ -1148,7 +1148,7 @@ def build_guide_embed(guild_id: int, page: str) -> discord.Embed:
         cmds = " · ".join(f"`{c}`" for c in available_cmds(k))
         usage = f" {f['usage']}" if f.get("usage") else ""
         embed.add_field(
-            name=f"{k}",
+            name=f"『{f['cat']}』 {k}",
             value=f"{f['desc']}\n└ {cmds}{usage}",
             inline=False
         )
@@ -1339,12 +1339,43 @@ def get_lock(guild_id: int) -> asyncio.Lock:
     return _GUILD_LOCKS.setdefault(guild_id, asyncio.Lock())
 
 
+def feature_has_saved_value(guild_id: int, key: str) -> bool:
+    """현재 서버에 해당 기능의 설정값/목록이 실제로 등록되어 있는지 확인합니다."""
+    feature = FEATURES.get(key, {})
+    gs = GUILD_SETTINGS.get(guild_id, {})
+    if key == "인증지급":
+        return bool(gs.get("auth_role_ids", []))
+    if key == "제재단어":
+        return bool(gs.get("ban_words", []))
+    if key == "검열단어":
+        return bool(gs.get("censor_words", []))
+    if key == "인증메세지":
+        return bool(str(gs.get("auth_form", "")).strip())
+    store = feature.get("store")
+    if store:
+        value = gs.get(store)
+        return value is not None and value != "" and value != 0 and value != []
+    return False
+
+
+def category_choice_label(key: str) -> str:
+    return f"『{FEATURES[key]['cat']}』 {key}"[:100]
+
 async def feature_autocomplete_for(interaction: discord.Interaction, current: str, verb: str):
     enabled = enabled_keys(interaction.guild.id) if interaction.guild else set()
     cur = current.lower()
-    return [app_commands.Choice(name=f"『{FEATURES[k]['cat']}』 · {k}"[:100], value=k)
-            for k, feature in FEATURES.items()
-            if k in enabled and verb in feature and cur in k.lower()][:25]
+    choices = []
+    for key, feature in FEATURES.items():
+        if key not in enabled or verb not in feature or cur not in key.lower():
+            continue
+        configured = feature_has_saved_value(interaction.guild.id, key) if interaction.guild else False
+        # 설정은 아직 값이 없는 항목만, 제거/초기화는 실제 값이 있는 항목만 표시합니다.
+        if verb == "set" and configured:
+            continue
+        if verb in ("remove", "reset") and not configured:
+            continue
+        choices.append(app_commands.Choice(name=category_choice_label(key), value=key))
+    return choices[:25]
 
 async def set_feature_autocomplete(interaction: discord.Interaction, current: str):
     return await feature_autocomplete_for(interaction, current, "set")
@@ -1360,8 +1391,9 @@ async def feature_autocomplete(interaction: discord.Interaction, current: str):
 
 async def all_feature_autocomplete(interaction: discord.Interaction, current: str):
     cur = current.lower()
-    return [app_commands.Choice(name=f"{FEATURES[k]['cat']} · {k}"[:100], value=k)
-            for k in FEATURES if cur in k.lower()][:25]
+    enabled = enabled_keys(interaction.guild.id) if interaction.guild else set()
+    return [app_commands.Choice(name=category_choice_label(key), value=key)
+            for key in FEATURES if key not in enabled and cur in key.lower()][:25]
 
 class SettingChannelSelect(discord.ui.ChannelSelect):
     def __init__(self, feature_key: str):
@@ -1606,7 +1638,7 @@ async def deactivate_autocomplete(interaction: discord.Interaction, current: str
     choices = []
     for k in FEATURES:
         if k in enabled_keys(interaction.guild.id) and cur in k.lower():
-            choices.append(app_commands.Choice(name=f"{FEATURES[k]['cat']} · {k}", value=k))
+            choices.append(app_commands.Choice(name=category_choice_label(k), value=k))
     return choices[:25]
 
 @app_commands.describe(기능="비활성화할 기능을 목록에서 선택하세요.")
@@ -1633,7 +1665,7 @@ async def deactivate_cb(interaction: discord.Interaction, 기능: str):
             register_guild_commands(guild.id)
             await interaction.followup.send(f"❌ 명령어 갱신에 실패했습니다. 잠시 후 다시 시도해 주세요.\n`{e}`")
             return
-    await interaction.followup.send(f"⛔ **{기능}** 기능을 비활성화했습니다. 저장된 설정값은 남아 있으니 `/활성화 {FEATURES[기능]['cat']} {기능}` 로 다시 켜면 그대로 쓸 수 있어요.")
+    await interaction.followup.send(f"⛔ **{기능}** 기능을 비활성화했습니다. 저장된 설정값은 남아 있으니 `/활성화`에서 『{FEATURES[기능]['cat']}』 {기능} 선택 로 다시 켜면 그대로 쓸 수 있어요.")
 
 def build_activation_group() -> app_commands.Command:
     return app_commands.Command(name="활성화", description="사용할 기능을 검색해 하나씩 활성화합니다.", callback=generic_activate_cb)
