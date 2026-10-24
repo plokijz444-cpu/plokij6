@@ -30,7 +30,7 @@ def keep_alive():
 # Render 등에서 Persistent Disk를 쓰면 DATA_DIR 환경변수에 마운트 경로(예: /data)를 넣어 주세요.
 DATA_DIR = os.getenv("DATA_DIR", ".")
 DATA_FILE = os.path.join(DATA_DIR, "guild_settings.json")
-COMMAND_VERSION = 1   # 전역 명령어 구성이 바뀔 때만 올리면 시작 시 1회 동기화됩니다.
+COMMAND_VERSION = 2   # 전역 명령어 구성이 바뀔 때만 올리면 시작 시 1회 동기화됩니다.
 META = {}
 
 def load_settings():
@@ -1342,40 +1342,143 @@ _GUILD_LOCKS = {}
 def get_lock(guild_id: int) -> asyncio.Lock:
     return _GUILD_LOCKS.setdefault(guild_id, asyncio.Lock())
 
+
+async def feature_autocomplete(interaction: discord.Interaction, current: str):
+    enabled = enabled_keys(interaction.guild.id) if interaction.guild else set()
+    cur = current.lower()
+    return [app_commands.Choice(name=f"{FEATURES[k]['cat']} · {k}"[:100], value=k)
+            for k in FEATURES if k in enabled and cur in k.lower()][:25]
+
+async def all_feature_autocomplete(interaction: discord.Interaction, current: str):
+    cur = current.lower()
+    return [app_commands.Choice(name=f"{FEATURES[k]['cat']} · {k}"[:100], value=k)
+            for k in FEATURES if cur in k.lower()][:25]
+
+@app_commands.describe(기능="설정할 기능을 선택하세요.", 값="채널은 #채널/ID, 역할은 @역할/ID, 문구나 단어는 내용을 입력하세요.")
+@app_commands.autocomplete(기능=feature_autocomplete)
+@app_commands.guild_only()
+@admin_only
+async def generic_set_cb(interaction: discord.Interaction, 기능: str, 값: str):
+    if 기능 not in enabled_keys(interaction.guild.id):
+        await interaction.response.send_message("❌ 먼저 `/활성화`에서 해당 기능을 활성화해 주세요.", ephemeral=True); return
+    gs = get_gs(interaction.guild.id)
+    import re
+    if 기능 in ("인증방", "제재로그", "입장로그", "퇴장로그"):
+        f = FEATURES[기능]; m = re.search(r"\d{15,25}", 값)
+        channel = interaction.guild.get_channel(int(m.group())) if m else None
+        if not isinstance(channel, discord.TextChannel):
+            await interaction.response.send_message("❌ 유효한 텍스트 채널을 `#채널` 또는 채널 ID로 입력해 주세요.", ephemeral=True); return
+        gs[f["store"]] = channel.id; result = f"✅ **{기능}**을 {channel.mention}(으)로 설정했습니다."
+    elif 기능 == "인증지급":
+        m = re.search(r"\d{15,25}", 값); role = interaction.guild.get_role(int(m.group())) if m else None
+        if not role:
+            await interaction.response.send_message("❌ 유효한 역할을 `@역할` 또는 역할 ID로 입력해 주세요.", ephemeral=True); return
+        if role >= interaction.guild.me.top_role:
+            await interaction.response.send_message("❌ 봇보다 높거나 같은 역할은 등록할 수 없습니다.", ephemeral=True); return
+        ids = gs.setdefault("auth_role_ids", [])
+        if role.id not in ids: ids.append(role.id)
+        result = f"✅ 인증 지급 역할에 {role.mention}을(를) 등록했습니다."
+    elif 기능 == "인증메세지":
+        gs["auth_form"] = 값; result = "✅ 인증 안내 메세지를 저장했습니다."
+    elif 기능 in ("제재단어", "검열단어"):
+        key = "ban_words" if 기능 == "제재단어" else "censor_words"
+        words = gs.setdefault(key, [])
+        added = [w.strip() for w in 값.split(",") if w.strip() and w.strip() not in words]
+        if not added:
+            await interaction.response.send_message("⚠️ 새로 등록할 단어가 없습니다.", ephemeral=True); return
+        words.extend(added); result = f"✅ {기능} 등록 완료: {', '.join(added)}"
+    else:
+        await interaction.response.send_message("❌ 이 항목은 값 설정을 지원하지 않습니다.", ephemeral=True); return
+    save_settings(GUILD_SETTINGS)
+    await interaction.response.send_message(result, ephemeral=True)
+
+@app_commands.describe(기능="확인할 기능을 선택하세요.")
+@app_commands.autocomplete(기능=feature_autocomplete)
+@app_commands.guild_only()
+@admin_only
+async def generic_check_cb(interaction: discord.Interaction, 기능: str):
+    f = FEATURES.get(기능, {}); gs = GUILD_SETTINGS.get(interaction.guild.id, {})
+    store = f.get("store")
+    if 기능 in ("인증방", "제재로그", "입장로그", "퇴장로그"):
+        ch = interaction.guild.get_channel(gs.get(store, 0)); value = ch.mention if ch else "설정되지 않음"
+    elif 기능 == "인증지급":
+        value = ", ".join(r.mention for r in (interaction.guild.get_role(x) for x in gs.get("auth_role_ids", [])) if r) or "설정되지 않음"
+    elif 기능 == "인증메세지": value = gs.get("auth_form", "설정되지 않음").replace("\\\\n", "\\n")
+    elif 기능 in ("제재단어", "검열단어"):
+        value = ", ".join(gs.get("ban_words" if 기능 == "제재단어" else "censor_words", [])) or "등록된 단어 없음"
+    else: value = "이 기능은 별도 설정값이 없습니다."
+    await interaction.response.send_message(f"📋 **{기능} 현재 설정**\\n{value[:1800]}", ephemeral=True)
+
+@app_commands.describe(기능="제거할 설정 항목을 선택하세요.", 값="단어 목록에서 특정 단어를 제거할 때 입력하세요. 비우면 목록 전체를 비웁니다.")
+@app_commands.autocomplete(기능=feature_autocomplete)
+@app_commands.guild_only()
+@admin_only
+async def generic_remove_cb(interaction: discord.Interaction, 기능: str, 값: str = ""):
+    f = FEATURES.get(기능, {}); gs = GUILD_SETTINGS.get(interaction.guild.id, {}); store = f.get("store")
+    if 기능 in ("제재단어", "검열단어"):
+        key = "ban_words" if 기능 == "제재단어" else "censor_words"; words = gs.get(key, [])
+        if 값:
+            if 값 not in words:
+                await interaction.response.send_message("❌ 해당 단어가 등록되어 있지 않습니다.", ephemeral=True); return
+            words.remove(값); result = f"🗑️ `{값}` 단어를 제거했습니다."
+        else: gs[key] = []; result = f"🗑️ {기능} 목록을 비웠습니다."
+    elif 기능 == "인증지급": gs["auth_role_ids"] = []; result = "🗑️ 인증지급 역할 목록을 비웠습니다."
+    elif store and store in gs: del gs[store]; result = f"🗑️ {기능} 설정을 제거했습니다."
+    else:
+        await interaction.response.send_message("❌ 제거할 설정이 없습니다.", ephemeral=True); return
+    save_settings(GUILD_SETTINGS); await interaction.response.send_message(result, ephemeral=True)
+
+@app_commands.describe(기능="초기화할 목록 기능을 선택하세요.")
+@app_commands.autocomplete(기능=feature_autocomplete)
+@app_commands.guild_only()
+@admin_only
+async def generic_reset_cb(interaction: discord.Interaction, 기능: str):
+    gs = GUILD_SETTINGS.get(interaction.guild.id, {})
+    key = {"인증지급":"auth_role_ids", "제재단어":"ban_words", "검열단어":"censor_words"}.get(기능)
+    if not key:
+        await interaction.response.send_message("❌ 이 기능은 목록 초기화를 지원하지 않습니다. `/제거`를 이용해 주세요.", ephemeral=True); return
+    old = gs.get(key, [])
+    if not old:
+        await interaction.response.send_message("⚠️ 초기화할 항목이 없습니다.", ephemeral=True); return
+    gs[key] = []; save_settings(GUILD_SETTINGS)
+    await interaction.response.send_message(f"♻️ **{기능}** 목록의 {len(old)}개 항목을 초기화했습니다.", ephemeral=True)
+
+@app_commands.describe(기능="활성화할 기능을 선택하세요.")
+@app_commands.autocomplete(기능=all_feature_autocomplete)
+@app_commands.guild_only()
+@admin_only
+async def generic_activate_cb(interaction: discord.Interaction, 기능: str):
+    if 기능 not in FEATURES:
+        await interaction.response.send_message("❌ 목록에서 기능을 선택해 주세요.", ephemeral=True); return
+    await activate_features(interaction, [기능])
+
+@app_commands.describe(대상="역할을 지급할 멤버", 역할="지급할 역할")
+@app_commands.guild_only()
+@app_commands.checks.has_permissions(manage_roles=True)
+async def give_role_cb(interaction: discord.Interaction, 대상: discord.Member, 역할: discord.Role):
+    if 역할 >= interaction.guild.me.top_role:
+        await interaction.response.send_message("❌ 봇보다 높거나 같은 역할은 지급할 수 없습니다.", ephemeral=True); return
+    try:
+        await 대상.add_roles(역할, reason=f"/역할주기 실행자: {interaction.user}")
+        await interaction.response.send_message(f"✅ {대상.mention}님에게 {역할.mention} 역할을 지급했습니다.", ephemeral=True)
+    except discord.Forbidden:
+        await interaction.response.send_message("❌ 봇의 역할 순위 또는 권한이 부족합니다.", ephemeral=True)
+
 def build_guild_commands(guild_id: int) -> list:
-    """이 서버에서 활성화된 기능만으로 명령어 묶음을 만듭니다."""
     enabled = enabled_keys(guild_id)
     if not enabled:
         return []
-    result = []
-    admin_perm = discord.Permissions(administrator=True)
-
-    for verb, (field, desc) in VERB_INFO.items():
-        keys = [k for k in FEATURES if k in enabled and field in FEATURES[k]]
-        if not keys:
-            continue
-        group = app_commands.Group(name=verb, description=desc, guild_only=True, default_permissions=admin_perm)
-        if verb == "설정":
-            for cat in CATEGORIES:
-                cat_keys = [k for k in keys if FEATURES[k]["cat"] == cat]
-                if not cat_keys:
-                    continue
-                sub = app_commands.Group(name=cat, description=f"{CATEGORIES[cat][1]} 설정"[:100])
-                for k in cat_keys:
-                    f = FEATURES[k]
-                    sub.add_command(app_commands.Command(name=k, description=leaf_description(verb, field, f), callback=f[field]))
-                group.add_command(sub)
-        else:
-            for k in keys:
-                f = FEATURES[k]
-                group.add_command(app_commands.Command(name=k, description=leaf_description(verb, field, f), callback=f[field]))
-        result.append(group)
-
+    result = [
+        app_commands.Command(name="설정", description="기능을 선택해 값을 설정합니다.", callback=generic_set_cb),
+        app_commands.Command(name="체크", description="기능의 현재 설정을 확인합니다.", callback=generic_check_cb),
+        app_commands.Command(name="제거", description="기능의 설정 또는 목록 항목을 제거합니다.", callback=generic_remove_cb),
+        app_commands.Command(name="초기화", description="기능의 목록을 초기화합니다.", callback=generic_reset_cb),
+        app_commands.Command(name="비활성화", description="켜 둔 기능을 끕니다.", callback=deactivate_cb),
+        app_commands.Command(name="역할주기", description="선택한 멤버에게 역할을 지급합니다.", callback=give_role_cb),
+    ]
     for k, f in FEATURES.items():
         if k in enabled and "top" in f:
             result.append(app_commands.Command(name=k, description=f["desc"][:100], callback=f["top"]))
-
-    result.append(app_commands.Command(name="비활성화", description="켜 둔 기능을 끕니다. (관리자 전용)", callback=deactivate_cb))
     return result
 
 def register_guild_commands(guild_id: int) -> discord.Object:
@@ -1463,32 +1566,8 @@ async def deactivate_cb(interaction: discord.Interaction, 기능: str):
             return
     await interaction.followup.send(f"⛔ **{기능}** 기능을 비활성화했습니다. 저장된 설정값은 남아 있으니 `/활성화 {FEATURES[기능]['cat']} {기능}` 로 다시 켜면 그대로 쓸 수 있어요.")
 
-def build_activation_group() -> app_commands.Group:
-    root = app_commands.Group(
-        name="활성화",
-        description="사용할 기능을 카테고리별로 골라 켭니다. (관리자 전용)",
-        guild_only=True,
-        default_permissions=discord.Permissions(administrator=True),
-    )
-    for cat, (emoji, desc) in CATEGORIES.items():
-        keys = [k for k, f in FEATURES.items() if f["cat"] == cat]
-        if not keys:
-            continue
-        sub = app_commands.Group(name=cat, description=f"{desc} 기능 활성화"[:100])
-        for k in keys:
-            sub.add_command(app_commands.Command(
-                name=k,
-                description=f"[활성화] {FEATURES[k]['desc']}"[:100],
-                callback=make_activate_cb([k]),
-            ))
-        if len(keys) > 1:
-            sub.add_command(app_commands.Command(
-                name="전체",
-                description=f"{cat} 카테고리의 기능을 한 번에 모두 활성화합니다."[:100],
-                callback=make_activate_cb(keys),
-            ))
-        root.add_command(sub)
-    return root
+def build_activation_group() -> app_commands.Command:
+    return app_commands.Command(name="활성화", description="사용할 기능을 검색해 하나씩 활성화합니다.", callback=generic_activate_cb)
 
 # ================= [ 실행 ] =================
 if __name__ == "__main__":
