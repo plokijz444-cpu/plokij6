@@ -423,7 +423,7 @@ async def on_message(message: discord.Message):
                     await message.delete()
                 except discord.HTTPException:
                     pass
-                await message.channel.send(f"⚠️ {message.author.mention}님의 메시지에 검열 대상 단어가 포함되어 스포일러 처리되었습니다:\n||{message.content}||")
+                await message.channel.send(f"⚠️ {message.author.mention}님의 메시지가 검열 대상 단어 포함으로 삭제되었습니다.")
                 return
 
     await bot.process_commands(message)
@@ -582,11 +582,11 @@ def make_set_words(key: str, label: str, done_text: str):
         words = get_gs(interaction.guild.id).setdefault(key, [])
         added = []
         for w in [w.strip() for w in 단어.split(",") if w.strip()]:
-            if w not in words:
-                words.append(w)
-                added.append(w)
+            # 중복 단어도 의도적으로 허용합니다.
+            words.append(w)
+            added.append(w)
         if not added:
-            await interaction.response.send_message(f"⚠️ 입력한 {label}는 이미 모두 등록되어 있거나 유효하지 않습니다.", ephemeral=True)
+            await interaction.response.send_message(f"⚠️ 등록할 {label}를 입력해 주세요.", ephemeral=True)
             return
         save_settings(GUILD_SETTINGS)
         await interaction.response.send_message(f"{done_text} `{', '.join(added)}` 가 서버 필터에 누적 등록되었습니다.", ephemeral=True)
@@ -1454,10 +1454,11 @@ class SettingTextModal(discord.ui.Modal):
         else:
             key = "ban_words" if self.feature_key == "제재단어" else "censor_words"
             words = gs.setdefault(key, [])
-            added = [word.strip() for word in value.split(",") if word.strip() and word.strip() not in words]
+            added = [word.strip() for word in value.split(",") if word.strip()]
             if not added:
-                await interaction.response.send_message("⚠️ 새로 등록할 단어가 없습니다.", ephemeral=True)
+                await interaction.response.send_message("⚠️ 등록할 단어를 입력해 주세요.", ephemeral=True)
                 return
+            # 기존 목록에 같은 단어가 있어도 중복 등록합니다.
             words.extend(added)
             result = f"✅ {self.feature_key} 등록 완료: {', '.join(added)}"
         save_settings(GUILD_SETTINGS)
