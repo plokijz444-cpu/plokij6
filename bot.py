@@ -179,7 +179,7 @@ async def confirm_by_reaction(interaction: discord.Interaction, warn_text: str, 
         print(f"확인 버튼 처리 오류: {exc}")
         try:
             await interaction.followup.send(
-                f"❌ 확인 절차에서 오류가 발생해 {action}을(를) 취소했습니다. 기존 상태는 변경하지 않았습니다.",
+                f"❌ 확인 절차에서 오류가 발생해 **{action}**{josa(action, '을', '를')} 취소했습니다. 기존 상태는 변경하지 않았습니다.",
                 ephemeral=True,
             )
         except discord.HTTPException:
@@ -196,7 +196,7 @@ async def confirm_by_reaction(interaction: discord.Interaction, warn_text: str, 
     if view.value is False:
         try:
             await interaction.followup.send(
-                f"🚫 {action}이(가) 취소되었습니다. 기존 상태는 그대로 유지됩니다.", ephemeral=True
+                f"🚫 **{action}**{josa(action, '이', '가')} 취소되었습니다. 기존 상태는 그대로 유지됩니다.", ephemeral=True
             )
         except discord.HTTPException:
             pass
@@ -204,7 +204,7 @@ async def confirm_by_reaction(interaction: discord.Interaction, warn_text: str, 
 
     try:
         await interaction.followup.send(
-            f"⏰ {CONFIRM_TIMEOUT}초 동안 선택하지 않아 {action}이(가) 자동 취소되었습니다.",
+            f"⏰ {CONFIRM_TIMEOUT}초 동안 선택하지 않아 **{action}**{josa(action, '이', '가')} 자동으로 취소되었습니다. 기존 상태는 그대로 유지됩니다.",
             ephemeral=True,
         )
     except discord.HTTPException:
@@ -438,7 +438,7 @@ async def approve_user_cb(interaction: discord.Interaction, 유저: discord.Memb
     auth_channel_id = settings.get("auth_channel")
 
     if not base_role_ids and not 추가역할:
-        await interaction.followup.send("❌ 지급할 기본 역할이나 추가역할이 없습니다. `/설정 인증 인증지급` 으로 먼저 등록해 주세요.")
+        await interaction.followup.send("❌ 지급할 기본 역할이나 추가역할이 없습니다. `/설정 인증지급` 으로 먼저 등록해 주세요.")
         return
 
     roles_to_add = []
@@ -1094,7 +1094,7 @@ async def clean_channel_cb(interaction: discord.Interaction):
     channel = interaction.channel
     guild = interaction.guild
     if guild.id in RUNNING_CLEANS:
-        await interaction.response.send_message("⏳ 이 서버에서 이미 채널 정리가 진행 중입니다.", ephemeral=True)
+        await interaction.response.send_message("⏳ 이 서버에서 이미 청소가 진행 중입니다. 끝난 뒤 다시 시도해 주세요.", ephemeral=True)
         return
     if not isinstance(channel, (discord.TextChannel, discord.VoiceChannel, discord.StageChannel)) and not (
         hasattr(discord, "ForumChannel") and isinstance(channel, discord.ForumChannel)
@@ -1102,26 +1102,26 @@ async def clean_channel_cb(interaction: discord.Interaction):
         await interaction.response.send_message("❌ 일반 채널·공지 채널·음성·스테이지·포럼 채널에서만 사용할 수 있습니다.", ephemeral=True)
         return
     warn_text = (
-        f"🧹 **경고: 채널 재생성**\n"
-        f"{interaction.user.mention}님, {channel.mention} 채널을 새로 만들고 기존 채널을 삭제합니다.\n"
-        f"채널 권한·설정·위치와 고정 메시지/고정 포스트를 복사합니다. 일반 메시지는 복사되지 않습니다.\n"
-        f"채널 ID는 바뀌지만, 낫또봇의 저장된 채널 설정은 새 ID로 갱신합니다.\n\n"
+        f"🧹 **경고: 채널 청소**\n"
+        f"{interaction.user.mention}님, {channel.mention} 채널을 같은 설정으로 새로 만들고 기존 채널을 삭제합니다.\n"
+        f"채널 권한·설정·위치와 고정 메시지/고정 포스트는 그대로 복원되며, 일반 메시지는 복원되지 않습니다.\n"
+        f"채널 ID는 바뀌지만, 낫또봇에 저장된 채널 설정은 새 ID로 자동 갱신됩니다.\n\n"
         f"✅ 진행 / ❌ 취소 (본인만 선택 가능, {CONFIRM_TIMEOUT}초 후 자동 취소)"
     )
-    if not await confirm_by_reaction(interaction, warn_text, "채널 재생성"):
+    if not await confirm_by_reaction(interaction, warn_text, "청소"):
         return
 
     RUNNING_CLEANS.add(guild.id)
     try:
         new_channel = await _recreate_one_channel(interaction, channel)
         await interaction.followup.send(
-            f"✅ 채널을 재생성했습니다: {new_channel.mention}\n"
+            f"✅ **청소 완료:** {new_channel.mention}\n"
             f"채널 설정과 고정 메시지/포스트를 복원했습니다. 일반 메시지는 복원하지 않았습니다.",
             ephemeral=True,
         )
     except Exception as exc:
         await interaction.followup.send(
-            f"❌ 채널 재생성에 실패했습니다. 기존 채널이 남아 있는지 확인해 주세요.\n`{str(exc)[:1200]}`",
+            f"❌ 청소에 실패했습니다. 기존 채널이 남아 있는지 확인해 주세요.\n`{str(exc)[:1200]}`",
             ephemeral=True,
         )
     finally:
@@ -1167,15 +1167,14 @@ async def clean_server_cb(interaction: discord.Interaction):
         return
 
     warn_text = (
-        f"🧨 **경고: 서버 전체 채널 재생성**\n"
-        f"{interaction.user.mention}님, 서버의 카테고리와 채널을 새로 만들고 기존 채널을 삭제합니다.\n"
-        f"채널 설정·권한·순서, 낫또봇의 입장로그 등 저장된 채널 설정을 새 채널 ID로 옮깁니다.\n"
-        f"텍스트 채널의 고정 메시지와 포럼의 고정 게시글을 복원합니다. 일반 메시지와 일반 스레드는 복원되지 않습니다.\n"
-        f"⚠️ 작업 도중 복제/복원이 실패하면 원본 채널은 삭제하지 않고 새로 만든 복제본을 정리합니다.\n\n"
-        f"🔴 빨간색 **진행** 버튼으로 실행 / ❌ **취소** 버튼으로 취소 "
-        f"(본인만 선택 가능, {CONFIRM_TIMEOUT}초 후 자동 취소)"
+        f"🧨 **경고: 서버청소**\n"
+        f"{interaction.user.mention}님, 서버의 모든 카테고리와 채널을 같은 설정으로 새로 만들고 기존 채널을 삭제합니다.\n"
+        f"채널 설정·권한·순서와, 낫또봇에 저장된 입장로그 등 채널 설정은 새 채널 ID로 자동 이전됩니다.\n"
+        f"텍스트 채널의 고정 메시지와 포럼의 고정 게시글은 복원되며, 일반 메시지와 일반 스레드는 복원되지 않습니다.\n"
+        f"⚠️ 작업 도중 복제/복원이 실패하면 원본 채널은 삭제하지 않고, 새로 만든 복제본만 정리합니다.\n\n"
+        f"✅ 진행 / ❌ 취소 (본인만 선택 가능, {CONFIRM_TIMEOUT}초 후 자동 취소)"
     )
-    if not await confirm_by_reaction(interaction, warn_text, "서버 전체 채널 재생성"):
+    if not await confirm_by_reaction(interaction, warn_text, "서버청소"):
         return
 
     RUNNING_CLEANS.add(guild.id)
@@ -1289,12 +1288,33 @@ async def clean_server_cb(interaction: discord.Interaction):
 
 # ---------- 가이드 ----------
 CATEGORY_WARN = {
-    "인증": "`인증방`·`인증지급`·`인증메세지` 중 하나라도 비어 있으면 신입에게 안내가 안 뜨거나 역할을 못 줘서 **가입 단계가 멈춥니다.** (`인증방`이 없으면 `/인증완료`도 실행되지 않아요.)",
-    "제재": "`제재로그`가 비어 있으면 **`/제재`·`/제재지우기`를 쓸 수 없고**, 자동 제재는 처리돼도 로그가 남지 않습니다.",
+    "인증": "`인증방`·`인증지급`·`인증메세지` 중 하나라도 비어 있으면 신입에게 안내가 뜨지 않거나 역할이 지급되지 않아 **가입 단계가 멈춥니다.** `인증방`이 없으면 `/인증완료`도 실행되지 않아요.",
+    "제재": "`제재로그`가 비어 있으면 **`/제재`·`/제재지우기`를 쓸 수 없고**, 자동 제재는 처리돼도 로그가 남지 않습니다. `/추방`은 영구 차단이라 `/추방해제`로만 풀 수 있어요.",
     "입퇴장": "로그 채널을 정하지 않으면 해당 입장/퇴장 기록이 남지 않습니다.",
-    "청소": "삭제는 **되돌릴 수 없습니다.** `/서버청소`는 채널·카테고리·입장로그 설정을 유지하지만 메시지·스레드·포럼 게시글은 삭제합니다.",
+    "청소": "채널은 **새로 만들어지고 기존 채널은 삭제**되므로 되돌릴 수 없습니다. 고정 메시지와 고정 포럼 게시글만 복원되고, 일반 메시지와 스레드는 복원되지 않아요. 실행 전 ✅/❌ 확인창이 한 번 더 나옵니다.",
     "기타": "",
 }
+
+# 개별 명령어를 실행하는 데 필요한 권한 (표에 없으면 관리자)
+PERM_LABELS = {
+    "인증완료": "역할 관리 권한",
+    "제재": "멤버 타임아웃 권한",
+    "제재지우기": "멤버 타임아웃 권한",
+    "추방": "멤버 차단 권한",
+    "추방해제": "멤버 차단 권한",
+    "번역": "모든 멤버",
+    "가이드": "모든 멤버",
+}
+
+def _feature_state(guild_id: int, key: str) -> tuple:
+    """(아이콘, 상태 문구)를 돌려줍니다."""
+    if key not in enabled_keys(guild_id):
+        return "⚪", "꺼짐"
+    if "top" in FEATURES[key]:
+        return "🟢", "사용 중"
+    if feature_has_saved_value(guild_id, key):
+        return "🟢", "설정됨"
+    return "🟡", "미설정"
 
 def build_guide_embed(guild_id: int, page: str) -> discord.Embed:
     enabled = enabled_keys(guild_id)
@@ -1302,37 +1322,99 @@ def build_guide_embed(guild_id: int, page: str) -> discord.Embed:
     embed.set_footer(text="안전하고 청정한 서버 환경을 구축합니다 • Powered by NattoBot")
 
     if page == "home":
+        on_total = sum(1 for k in FEATURES if k in enabled)
         embed.title = "🛡️ 낫또봇 가이드"
-        embed.description = "아래 메뉴에서 카테고리를 골라 각 명령어의 사용법과 설정 방법을 확인하세요."
-        embed.add_field(name="⚙️ 기능 활성화", value="`/활성화`에서 기능을 선택하거나 `/모두활성화`로 전체 기능을 켭니다. `/모두비활성화`는 전체 기능을 끕니다.", inline=False)
-        embed.add_field(name="🛠️ 설정 및 관리", value="`/설정`은 항목에 맞는 채널·역할 선택창 또는 문구 입력창을 엽니다. `/제거`는 제거 가능한 항목만, `/초기화`는 초기화 가능한 목록만 선택할 수 있습니다.", inline=False)
-        embed.set_author(name="아래 메뉴에서 카테고리를 골라 자세히 보세요 👇")
+        embed.description = (
+            "인증 · 제재 · 로그 · 청소까지, 서버 운영에 필요한 도구를 한곳에서 관리합니다.\n"
+            "아래 메뉴에서 카테고리를 골라 자세히 확인해 보세요."
+        )
+        embed.add_field(
+            name="🚀 빠른 시작",
+            value=(
+                "**1.** `/활성화` 로 필요한 기능 켜기 (전부 켜려면 `/모두활성화`)\n"
+                "**2.** `/설정` 으로 채널·역할·문구 등록\n"
+                "**3.** `/체크` 로 설정이 잘 들어갔는지 확인"
+            ),
+            inline=False,
+        )
+        lines = []
+        for cat, (emoji, desc) in CATEGORIES.items():
+            keys = [k for k, f in FEATURES.items() if f["cat"] == cat]
+            on = sum(1 for k in keys if k in enabled)
+            lines.append(f"{emoji} **{cat}** — {desc} `{on}/{len(keys)}`")
+        embed.add_field(name="📚 카테고리  (켜짐/전체)", value="\n".join(lines), inline=False)
+        embed.add_field(
+            name="🧰 공통 명령어",
+            value="`/활성화` `/설정` `/체크` `/제거` `/초기화` `/비활성화` `/역할주기` 의 사용법은 **공통 명령어** 메뉴에서 볼 수 있어요.",
+            inline=False,
+        )
+        embed.add_field(
+            name="📊 우리 서버 현황",
+            value=f"켜진 기능 **{on_total}** / {len(FEATURES)}개\n🟢 사용 중 · 🟡 켜졌지만 값 미설정 · ⚪ 꺼짐",
+            inline=False,
+        )
         return embed
 
     if page == "common":
         embed.title = "🧰 공통 명령어"
-        embed.description = "각 관리 명령어의 사용법입니다."
-        embed.add_field(name="⚙️ /설정 [기능]", value="기능을 고르면 채널·역할 선택창 또는 문구 입력창이 열립니다.", inline=False)
-        embed.add_field(name="📋 /체크 [기능]", value="현재 설정된 값을 확인합니다.", inline=False)
-        embed.add_field(name="🗑️ /제거 [기능]", value="설정을 지우거나, 목록에서 하나만 골라 뺍니다.", inline=False)
-        embed.add_field(name="♻️ /초기화 [기능]", value="목록을 전부 비웁니다. 경고 메시지의 ✅ 를 눌러야 실행되고 ❌ 는 취소예요.", inline=False)
-        embed.add_field(name="⛔ /비활성화 [기능]", value="선택한 기능을 끕니다. 저장된 설정값은 유지됩니다.", inline=False)
-        embed.add_field(name="✅ /모두활성화", value="전체 기능을 한 번에 활성화합니다.", inline=False)
-        embed.add_field(name="⛔ /모두비활성화", value="전체 기능을 한 번에 비활성화합니다.", inline=False)
+        embed.description = "기능을 켜고, 값을 설정하고, 관리하는 명령어입니다. (기본적으로 관리자 전용)"
+        embed.add_field(
+            name="🔌 기능 켜고 끄기",
+            value=(
+                "`/활성화 [기능]` — 선택한 기능을 켭니다.\n"
+                "`/모두활성화` — 모든 기능을 한 번에 켭니다.\n"
+                "`/비활성화 [기능]` — 선택한 기능을 끕니다. 저장된 설정값은 유지돼요.\n"
+                "`/모두비활성화` — 모든 기능을 한 번에 끕니다."
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="⚙️ 설정 관리",
+            value=(
+                "`/설정 [기능]` — 채널·역할 선택창 또는 문구 입력창을 엽니다.\n"
+                "`/체크 [기능]` — 현재 저장된 설정을 확인합니다.\n"
+                "`/제거 [기능] [값]` — 설정을 지웁니다. 단어 기능은 `값`에 단어를 적으면 그 단어만, 비우면 전체를 지우고, `인증지급`은 등록된 역할 전체를 비웁니다.\n"
+                "`/초기화 [기능]` — `인증지급`·`제재단어`·`검열단어` 목록을 모두 비웁니다. 확인창에서 ✅ 를 눌러야 실행되고 ❌ 는 취소예요."
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="🎖️ 역할 지급",
+            value="`/역할주기 [대상] [역할]` — 선택한 멤버에게 역할을 지급합니다. (역할 관리 권한 · 봇보다 높은 역할은 불가)",
+            inline=False,
+        )
+        embed.add_field(
+            name="💡 알아두세요",
+            value="`/설정` `/체크` `/제거` `/초기화` `/비활성화` `/역할주기` 는 기능을 하나 이상 켜면 나타납니다. 꺼진 기능은 `/설정`·`/체크` 목록에 보이지 않아요.",
+            inline=False,
+        )
         return embed
 
     emoji, desc = CATEGORIES[page]
-    embed.title = f"{emoji} {page} 카테고리"
-    embed.description = desc
+    embed.title = f"{emoji} {page}"
+    embed.description = f"{desc}\n🟢 사용 중 · 🟡 켜졌지만 값 미설정 · ⚪ 꺼짐"
     for k, f in FEATURES.items():
         if f["cat"] != page:
             continue
+        icon, state = _feature_state(guild_id, k)
+        is_top = "top" in f
+        title = f"/{k}" if is_top else k
         cmds = " · ".join(f"`{c}`" for c in available_cmds(k))
         usage = f" {f['usage']}" if f.get("usage") else ""
+        lines = [f["desc"]]
+        if is_top:
+            lines.append(f"**사용** {cmds}{usage}")
+        else:
+            lines.append(f"**명령어** {cmds}")
+            if f.get("usage"):
+                lines.append(f"**입력값** {f['usage']}")
+        lines.append(f"**권한** {PERM_LABELS.get(k, '관리자')}")
+        if k not in enabled:
+            lines.append("➜ `/활성화` 에서 먼저 켜 주세요.")
         embed.add_field(
-            name=f"『{f['cat']}』 {k}",
-            value=f"{f['desc']}\n└ {cmds}{usage}",
-            inline=False
+            name=f"{icon} {title} · {state}",
+            value="\n".join(lines)[:1024],
+            inline=False,
         )
     warn = CATEGORY_WARN.get(page)
     if warn:
@@ -1344,10 +1426,10 @@ class GuideView(discord.ui.View):
         super().__init__(timeout=300)
         self.guild_id = guild_id
         self.interaction = None
-        options = [discord.SelectOption(label="시작하기", value="home", emoji="🏠", description="명령어 사용법과 설정 방법")]
+        options = [discord.SelectOption(label="시작하기", value="home", emoji="🏠", description="빠른 시작과 전체 구성")]
         for cat, (emoji, desc) in CATEGORIES.items():
             options.append(discord.SelectOption(label=cat, value=cat, emoji=emoji, description=desc[:100]))
-        options.append(discord.SelectOption(label="공통 명령어", value="common", emoji="🧰", description="설정·체크·제거·초기화 사용법"))
+        options.append(discord.SelectOption(label="공통 명령어", value="common", emoji="🧰", description="활성화·설정·체크·제거·초기화·역할주기"))
         select = discord.ui.Select(placeholder="📚 보고 싶은 항목을 선택하세요", options=options)
         select.callback = self.on_select
         self.add_item(select)
@@ -1460,8 +1542,8 @@ CATEGORIES = {
     "인증": ("🪪", "신입 유저 인증과 역할 지급"),
     "제재": ("🚨", "제재·검열·추방 관리"),
     "입퇴장": ("🚪", "유저 입장·퇴장 로그"),
-    "청소": ("🧹", "메세지·스레드 청소"),
-    "기타": ("📖", "사용법 안내"),
+    "청소": ("🧹", "채널·서버를 새로 만들어 깔끔하게 청소"),
+    "기타": ("📖", "번역과 사용법 안내"),
 }
 
 FEATURES = {
@@ -1548,11 +1630,11 @@ FEATURES = {
     },
     # ---------- 청소 ----------
     "청소": {
-        "cat": "청소", "desc": "현재 채널을 같은 설정으로 재생성하고 고정 메시지/포스트를 복원합니다. (관리자, 확인 필요)", "usage": "",
+        "cat": "청소", "desc": "현재 채널을 같은 설정으로 새로 만들어 메시지를 비웁니다. 고정 메시지·포스트는 복원됩니다.", "usage": "",
         "top": clean_channel_cb,
     },
     "서버청소": {
-        "cat": "청소", "desc": "채널·카테고리와 낫또봇 설정은 유지하고 메시지·스레드·포럼 게시글만 삭제합니다. (관리자, 확인 필요)", "usage": "",
+        "cat": "청소", "desc": "서버의 모든 채널·카테고리를 같은 설정으로 새로 만들어 메시지를 비웁니다. 고정 메시지는 복원됩니다.", "usage": "",
         "top": clean_server_cb,
     },
     # ---------- 기타 ----------
@@ -1770,11 +1852,11 @@ async def generic_check_cb(interaction: discord.Interaction, 기능: str):
         ch = interaction.guild.get_channel(gs.get(store, 0)); value = ch.mention if ch else "설정되지 않음"
     elif 기능 == "인증지급":
         value = ", ".join(r.mention for r in (interaction.guild.get_role(x) for x in gs.get("auth_role_ids", [])) if r) or "설정되지 않음"
-    elif 기능 == "인증메세지": value = gs.get("auth_form", "설정되지 않음").replace("\\\\n", "\\n")
+    elif 기능 == "인증메세지": value = gs.get("auth_form", "설정되지 않음").replace("\\n", "\n")
     elif 기능 in ("제재단어", "검열단어"):
         value = ", ".join(gs.get("ban_words" if 기능 == "제재단어" else "censor_words", [])) or "등록된 단어 없음"
     else: value = "이 기능은 별도 설정값이 없습니다."
-    await interaction.response.send_message(f"📋 **{기능} 현재 설정**\\n{value[:1800]}", ephemeral=True)
+    await interaction.response.send_message(f"📋 **{기능} 현재 설정**\n{value[:1800]}", ephemeral=True)
 
 @app_commands.describe(기능="제거할 설정 항목을 선택하세요.", 값="단어 목록에서 특정 단어를 제거할 때 입력하세요. 비우면 목록 전체를 비웁니다.")
 @app_commands.autocomplete(기능=remove_feature_autocomplete)
@@ -1804,16 +1886,10 @@ async def generic_remove_cb(interaction: discord.Interaction, 기능: str, 값: 
 @admin_only
 async def generic_reset_cb(interaction: discord.Interaction, 기능: str):
     if 기능 not in FEATURES or "reset" not in FEATURES[기능]:
-        await interaction.response.send_message("❌ 초기화할 수 있는 목록을 선택해 주세요.", ephemeral=True); return
-    gs = GUILD_SETTINGS.get(interaction.guild.id, {})
-    key = {"인증지급":"auth_role_ids", "제재단어":"ban_words", "검열단어":"censor_words"}.get(기능)
-    if not key:
-        await interaction.response.send_message("❌ 이 기능은 목록 초기화를 지원하지 않습니다. `/제거`를 이용해 주세요.", ephemeral=True); return
-    old = gs.get(key, [])
-    if not old:
-        await interaction.response.send_message("⚠️ 초기화할 항목이 없습니다.", ephemeral=True); return
-    gs[key] = []; save_settings(GUILD_SETTINGS)
-    await interaction.response.send_message(f"♻️ **{기능}** 목록의 {len(old)}개 항목을 초기화했습니다.", ephemeral=True)
+        await interaction.response.send_message("❌ 초기화할 수 있는 목록을 선택해 주세요.", ephemeral=True)
+        return
+    # 목록 초기화는 ✅/❌ 2차 확인(make_reset)을 거친 뒤 실행됩니다.
+    await FEATURES[기능]["reset"](interaction)
 
 @app_commands.describe(기능="활성화할 기능을 선택하세요.")
 @app_commands.autocomplete(기능=all_feature_autocomplete)
@@ -1994,7 +2070,7 @@ async def deactivate_all_cb(interaction: discord.Interaction):
             gs["enabled"] = previous
             save_settings(GUILD_SETTINGS)
             register_guild_commands(guild.id)
-            await interaction.followup.send(f"❌ 전체 비활성화 중 명령어 갱신에 실패했습니다.\\n`{e}`")
+            await interaction.followup.send(f"❌ 전체 비활성화 중 명령어 갱신에 실패했습니다.\n`{e}`")
             return
     await interaction.followup.send(f"⛔ 전체 기능 {len(old)}개를 비활성화했습니다. 저장된 설정값은 유지됩니다.")
 
