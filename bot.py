@@ -159,7 +159,7 @@ async def confirm_by_reaction(interaction: discord.Interaction, warn_text: str, 
                 return False
             return True
 
-        @discord.ui.button(label="진행", style=discord.ButtonStyle.danger, emoji="✅")
+        @discord.ui.button(label="진행", style=discord.ButtonStyle.secondary, emoji="✅")
         async def confirm(self, button_interaction: discord.Interaction, button: discord.ui.Button):
             self.value = True
             await button_interaction.response.defer()
@@ -1157,87 +1157,129 @@ async def collect_all_threads(guild: discord.Guild) -> dict:
 @app_commands.guild_only()
 @admin_only
 async def clean_server_cb(interaction: discord.Interaction):
-    """채널/카테고리는 유지하고 메시지와 스레드/포럼 게시글만 정리합니다."""
+    """서버의 채널을 복제하고 고정 메시지/포스트를 복원한 뒤 원본 채널을 삭제합니다."""
     guild = interaction.guild
     if guild.id in RUNNING_CLEANS:
-        await interaction.response.send_message("⏳ 이 서버에서 이미 청소가 진행 중입니다. 끝난 뒤 다시 시도해 주세요.", ephemeral=True)
+        await interaction.response.send_message(
+            "⏳ 이 서버에서 이미 청소가 진행 중입니다. 끝난 뒤 다시 시도해 주세요.",
+            ephemeral=True,
+        )
         return
 
     warn_text = (
-        f"🧨 **경고: 서버 메시지 전체 청소**\n"
-        f"{interaction.user.mention}님, 서버의 **메시지, 스레드, 포럼 게시글**이 삭제됩니다.\n"
-        f"✅ **채널·카테고리·권한·입장로그 설정은 삭제하거나 재생성하지 않습니다.** 따라서 설정된 입장로그 채널을 그대로 사용합니다.\n"
-        f"⚠️ 메시지와 게시글은 되돌릴 수 없습니다. 고정 메시지도 삭제될 수 있습니다.\n\n"
-        f"✅ 진행 / ❌ 취소 (본인만 선택 가능, {CONFIRM_TIMEOUT}초 후 자동 취소)"
+        f"🧨 **경고: 서버 전체 채널 재생성**\n"
+        f"{interaction.user.mention}님, 서버의 카테고리와 채널을 새로 만들고 기존 채널을 삭제합니다.\n"
+        f"채널 설정·권한·순서, 낫또봇의 입장로그 등 저장된 채널 설정을 새 채널 ID로 옮깁니다.\n"
+        f"텍스트 채널의 고정 메시지와 포럼의 고정 게시글을 복원합니다. 일반 메시지와 일반 스레드는 복원되지 않습니다.\n"
+        f"⚠️ 작업 도중 복제/복원이 실패하면 원본 채널은 삭제하지 않고 새로 만든 복제본을 정리합니다.\n\n"
+        f"🔴 빨간색 **진행** 버튼으로 실행 / ❌ **취소** 버튼으로 취소 "
+        f"(본인만 선택 가능, {CONFIRM_TIMEOUT}초 후 자동 취소)"
     )
-    if not await confirm_by_reaction(interaction, warn_text, "서버 메시지 청소"):
+    if not await confirm_by_reaction(interaction, warn_text, "서버 전체 채널 재생성"):
         return
 
     RUNNING_CLEANS.add(guild.id)
-    stats = {"messages": 0, "threads": 0, "skipped": 0, "failed": 0}
+    created = []
+    snapshots = []
+    channel_map = {}
+    originals_deleted = 0
     try:
         try:
             await interaction.followup.send(
-                "🧹 서버 메시지 청소를 시작했습니다. 채널과 저장된 설정은 유지됩니다.",
+                "🧹 서버 전체 채널을 백업하고 복제합니다. 원본 채널은 복제가 끝나기 전까지 삭제하지 않습니다.",
                 ephemeral=True,
             )
         except discord.HTTPException:
             pass
 
-        # 1) 스레드 및 포럼 게시글 삭제. 채널 자체는 삭제하지 않습니다.
-        threads = await collect_all_threads(guild)
-        for thread in threads.values():
-            parent = thread.parent
-            if parent is None:
-                stats["skipped"] += 1
-                continue
-            perms = parent.permissions_for(guild.me)
-            if not perms.manage_threads:
-                stats["skipped"] += 1
-                continue
-            try:
-                await thread.delete(reason=f"/서버청소 (집행자: {interaction.user})")
-                stats["threads"] += 1
-            except discord.HTTPException:
-                stats["failed"] += 1
+        # 1) 먼저 모든 채널 설정과 고정 콘텐츠를 메모리에 저장합니다.
+        original_channels = list(guild.channels)
+        for channel in original_channels:
+            snapshots.append(await _snapshot_channel(channel, guild))
 
-        # 2) 텍스트/공지 채널의 메시지만 삭제. 채널과 설정 ID는 그대로 둡니다.
-        for channel in list(guild.text_channels):
-            perms = channel.permissions_for(guild.me)
-            if not (perms.view_channel and perms.manage_messages and perms.read_message_history):
-                stats["skipped"] += 1
+        # 2) 카테고리를 먼저 만들고, 그다음 나머지 채널을 원래 카테고리에 연결합니다.
+        ordered_snapshots = (
+            [snap for snap in snapshots if snap["kind"] == "category"]
+            + [snap for snap in snapshots if snap["kind"] != "category"]
+        )
+        for snap in ordered_snapshots:
+            old_category_id = snap.get("category_id")
+            new_category = channel_map.get(old_category_id) if old_category_id else None
+            new_channel = await _create_channel_copy(guild, snap, category=new_category)
+            created.append(new_channel)
+            channel_map[snap["id"]] = new_channel
+
+        # 3) 복제본이 전부 만들어진 뒤 고정 메시지와 고정 포럼 게시글을 복원합니다.
+        for snap in snapshots:
+            if snap["kind"] == "category":
                 continue
+            await _restore_channel_pins(channel_map[snap["id"]], snap)
+
+        # 4) 모든 복제와 복원이 성공한 경우에만 원본을 삭제합니다.
+        delete_order = (
+            [snap for snap in reversed(snapshots) if snap["kind"] != "category"]
+            + [snap for snap in reversed(snapshots) if snap["kind"] == "category"]
+        )
+        delete_errors = []
+        for snap in delete_order:
+            old_channel = snap["old"]
             try:
-                deleted = await channel.purge(
-                    limit=None,
-                    bulk=True,
-                    reason=f"/서버청소 (집행자: {interaction.user})",
+                await old_channel.delete(reason=f"/서버청소 (집행자: {interaction.user})")
+                originals_deleted += 1
+            except discord.HTTPException as exc:
+                delete_errors.append(f"{getattr(old_channel, 'name', snap['id'])}: {exc}")
+
+        # 5) 원래 순서를 최대한 복원합니다. 순서 변경 실패만으로 전체 작업을 중단하지 않습니다.
+        for snap in sorted(snapshots, key=lambda item: item.get("position", 0)):
+            try:
+                await channel_map[snap["id"]].edit(
+                    position=snap.get("position", 0),
+                    reason="낫또봇 서버청소: 채널 순서 복원",
                 )
-                stats["messages"] += len(deleted)
-            except discord.HTTPException:
-                stats["failed"] += 1
+            except (discord.HTTPException, AttributeError):
+                pass
+
+        _remap_saved_channel_ids(guild.id, {old_id: new.id for old_id, new in channel_map.items()})
 
         embed = discord.Embed(
-            title="🧹 서버 메시지 청소 완료",
+            title="🧹 서버 전체 청소 완료",
             color=discord.Color.dark_red(),
             timestamp=discord.utils.utcnow(),
         )
-        embed.add_field(name="💬 삭제한 메시지", value=f"{stats['messages']}개", inline=True)
-        embed.add_field(name="🧵 삭제한 스레드·포럼 게시글", value=f"{stats['threads']}개", inline=True)
-        embed.add_field(name="⏭️ 권한 부족/접근 불가", value=f"{stats['skipped']}곳", inline=True)
-        if stats["failed"]:
-            embed.add_field(name="⚠️ 오류로 실패", value=f"{stats['failed']}곳", inline=True)
+        embed.add_field(name="📦 복제한 채널/카테고리", value=f"{len(created)}개", inline=True)
+        embed.add_field(name="🗑️ 삭제한 원본 채널/카테고리", value=f"{originals_deleted}개", inline=True)
         embed.add_field(
-            name="🔒 유지되는 항목",
-            value="채널·카테고리·권한·채널 ID·낫또봇 설정(입장로그 포함)",
+            name="🔒 설정",
+            value="채널 설정·권한·순서 및 낫또봇의 저장된 입장로그 등 채널 ID 설정을 새 ID로 갱신했습니다.",
             inline=False,
         )
-        embed.set_footer(text="메시지와 게시글은 복구할 수 없습니다. 권한이 부족한 곳은 건너뛰었습니다.")
+        embed.add_field(
+            name="📌 콘텐츠",
+            value="고정 메시지와 고정 포럼 게시글을 복원했습니다. 일반 메시지와 일반 스레드는 복원하지 않습니다.",
+            inline=False,
+        )
+        if delete_errors:
+            embed.add_field(
+                name="⚠️ 삭제하지 못한 원본",
+                value="일부 원본 채널은 권한 또는 Discord 오류로 남아 있을 수 있습니다. 중복 채널을 확인해 주세요.\n"
+                      + "\n".join(f"• {err}" for err in delete_errors[:8])[:1000],
+                inline=False,
+            )
         await interaction.followup.send(embed=embed, ephemeral=True)
+
     except Exception as exc:
+        # 복제 또는 콘텐츠 복원 단계에서 실패했다면 원본은 아직 삭제하지 않았으므로 복제본만 정리합니다.
+        if originals_deleted == 0 and created:
+            await _delete_created_channels(created)
         try:
+            status = (
+                "원본 채널은 삭제하지 않았으며 생성한 복제본을 정리했습니다.\n"
+                if originals_deleted == 0 else
+                f"원본 채널 {originals_deleted}개가 이미 삭제되었을 수 있으니 서버 채널 목록을 확인해 주세요.\n"
+            )
             await interaction.followup.send(
-                f"⚠️ 청소 도중 예상하지 못한 오류가 발생했습니다. 채널과 설정은 삭제하지 않았습니다.\n`{str(exc)[:1000]}`",
+                "❌ 서버청소 중 오류가 발생했습니다. " + status
+                + f"`{type(exc).__name__}: {str(exc)[:900]}`",
                 ephemeral=True,
             )
         except discord.HTTPException:
