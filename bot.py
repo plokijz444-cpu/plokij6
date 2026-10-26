@@ -10,6 +10,7 @@ import json
 import tempfile
 import traceback
 import io
+import re
 import aiohttp
 
 # ================= [ Render 24시간 가동을 위한 웹서버 ] =================
@@ -32,7 +33,7 @@ def keep_alive():
 # Render 등에서 Persistent Disk를 쓰면 DATA_DIR 환경변수에 마운트 경로(예: /data)를 넣어 주세요.
 DATA_DIR = os.getenv("DATA_DIR", ".")
 DATA_FILE = os.path.join(DATA_DIR, "guild_settings.json")
-COMMAND_VERSION = 4   # 전역 명령어 구성이 바뀔 때만 올리면 시작 시 1회 동기화됩니다.
+COMMAND_VERSION = 5   # 전역 명령어 구성이 바뀔 때만 올리면 시작 시 1회 동기화됩니다.
 META = {}
 
 def load_settings():
@@ -368,7 +369,25 @@ async def on_member_join(member: discord.Member):
 
     join_log_id = settings.get("join_log_channel")
     if is_on(guild_id, "입장로그") and join_log_id:
-        join_log_channel = member.guild.get_channel(join_log_id)
+        try:
+            join_log_channel = member.guild.get_channel(int(join_log_id))
+        except (TypeError, ValueError):
+            join_log_channel = None
+
+        # 이전 서버청소에서 저장된 ID가 낡았을 경우, 저장된 채널 이름으로 자동 복구합니다.
+        if join_log_channel is None:
+            saved_name = settings.get("join_log_channel_name")
+            candidate_names = [saved_name, "입장로그", "입장-로그", "join-log", "join_log", "joinlog"]
+            normalized_names = {name.casefold() for name in candidate_names if isinstance(name, str) and name.strip()}
+            join_log_channel = next(
+                (ch for ch in member.guild.text_channels if ch.name.casefold() in normalized_names),
+                None,
+            )
+            if join_log_channel is not None:
+                settings["join_log_channel"] = join_log_channel.id
+                settings["join_log_channel_name"] = join_log_channel.name
+                save_settings(GUILD_SETTINGS)
+
         if join_log_channel:
             now = datetime.datetime.now().strftime('%Y년 %m월 %d일 %H시 %M분')
             created_at = member.created_at.strftime('%Y년 %m월 %d일 %H시 %M분')
@@ -466,7 +485,9 @@ def make_set_channel(store: str, label: str):
     @app_commands.describe(채널=f"{label}에 사용할 텍스트 채널을 선택하세요.")
     @admin_only
     async def cb(interaction: discord.Interaction, 채널: discord.TextChannel):
-        get_gs(interaction.guild.id)[store] = 채널.id
+        gs = get_gs(interaction.guild.id)
+        gs[store] = 채널.id
+        gs[f"{store}_name"] = 채널.name  # 채널이 삭제/교체됐을 때 복구할 수 있도록 이름도 저장
         save_settings(GUILD_SETTINGS)
         await interaction.response.send_message(f"✅ {label}{josa(label, '이', '가')} {채널.mention}(으)로 설정되었습니다.", ephemeral=True)
     return cb
@@ -477,6 +498,7 @@ def make_remove_channel(store: str, label: str):
         gs = GUILD_SETTINGS.get(interaction.guild.id, {})
         if store in gs:
             del gs[store]
+            gs.pop(f"{store}_name", None)
             save_settings(GUILD_SETTINGS)
             await interaction.response.send_message(f"🗑️ {label} 설정이 완전히 제거되었습니다.", ephemeral=True)
         else:
@@ -1374,112 +1396,121 @@ async def clean_channel_cb(interaction: discord.Interaction):
     finally:
         RUNNING_CLEANS.discard(guild.id)
 
+async def collect_all_threads(guild: discord.Guild) -> dict:
+    """활성 스레드와 접근 가능한 보관 스레드/포럼 게시글을 수집합니다."""
+    found = {thread.id: thread for thread in getattr(guild, "threads", [])}
+    try:
+        for thread in await guild.active_threads():
+            found[thread.id] = thread
+    except (discord.HTTPException, AttributeError):
+        pass
+
+    for channel in guild.channels:
+        if not isinstance(channel, (discord.TextChannel, discord.ForumChannel)):
+            continue
+        perms = channel.permissions_for(guild.me)
+        if not (perms.view_channel and perms.read_message_history):
+            continue
+        try:
+            async for thread in channel.archived_threads(limit=None):
+                found[thread.id] = thread
+            if isinstance(channel, discord.TextChannel) and perms.manage_threads:
+                async for thread in channel.archived_threads(limit=None, private=True):
+                    found[thread.id] = thread
+        except (discord.HTTPException, AttributeError):
+            # 접근할 수 없는 보관 스레드는 아래 건너뜀 통계에 포함됩니다.
+            continue
+    return found
+
+@app_commands.default_permissions(administrator=True)
 @app_commands.guild_only()
 @admin_only
 async def clean_server_cb(interaction: discord.Interaction):
+    """채널/카테고리는 유지하고 메시지와 스레드/포럼 게시글만 정리합니다."""
     guild = interaction.guild
     if guild.id in RUNNING_CLEANS:
-        await interaction.response.send_message("⏳ 이 서버에서 이미 채널 정리가 진행 중입니다.", ephemeral=True)
-        return
-    if not guild.me.guild_permissions.manage_channels:
-        await interaction.response.send_message("❌ 봇에게 서버 채널 관리 권한이 필요합니다.", ephemeral=True)
-        return
-
-    old_channels = list(guild.channels)
-    snapshots = []
-    # 지원하지 않는 채널이 하나라도 있으면, 일부만 지우는 일이 없도록 사전 검사에서 중단합니다.
-    try:
-        for channel in old_channels:
-            snapshots.append(await _snapshot_channel(channel, guild))
-    except Exception as exc:
-        await interaction.response.send_message(
-            f"❌ 서버 전체 재생성 전 검사에 실패했습니다. 아무 채널도 삭제하지 않았습니다.\n`{str(exc)[:1200]}`",
-            ephemeral=True,
-        )
+        await interaction.response.send_message("⏳ 이 서버에서 이미 청소가 진행 중입니다. 끝난 뒤 다시 시도해 주세요.", ephemeral=True)
         return
 
     warn_text = (
-        f"🧨 **경고: 서버 전체 채널 재생성**\n"
-        f"이 작업은 **{len(old_channels)}개 채널/카테고리**를 새로 만들고 기존 채널을 삭제합니다.\n"
-        f"채널 종류·권한·카테고리·순서·동기화 설정과 고정 메시지/포럼 고정 포스트를 복사합니다.\n"
-        f"일반 메시지, 기존 채널 ID, 채널 초대 링크 및 외부 봇/웹훅의 채널 참조는 보존되지 않을 수 있습니다.\n"
-        f"새 채널 생성과 고정 메시지 복사가 전부 성공한 뒤에만 원본 삭제를 시작합니다.\n\n"
+        f"🧨 **경고: 서버 메시지 전체 청소**\n"
+        f"{interaction.user.mention}님, 서버의 **메시지, 스레드, 포럼 게시글**이 삭제됩니다.\n"
+        f"✅ **채널·카테고리·권한·입장로그 설정은 삭제하거나 재생성하지 않습니다.** 따라서 설정된 입장로그 채널을 그대로 사용합니다.\n"
+        f"⚠️ 메시지와 게시글은 되돌릴 수 없습니다. 고정 메시지도 삭제될 수 있습니다.\n\n"
         f"✅ 진행 / ❌ 취소 (본인만 선택 가능, {CONFIRM_TIMEOUT}초 후 자동 취소)"
     )
-    if not await confirm_by_reaction(interaction, warn_text, "서버 전체 채널 재생성"):
+    if not await confirm_by_reaction(interaction, warn_text, "서버 메시지 청소"):
         return
 
     RUNNING_CLEANS.add(guild.id)
-    created = []
-    channel_map = {}
+    stats = {"messages": 0, "threads": 0, "skipped": 0, "failed": 0}
     try:
-        await interaction.followup.send(
-            "🧨 서버 채널 복제를 시작했습니다. 원본 채널은 복제가 끝날 때까지 삭제하지 않습니다.",
-            ephemeral=True,
-        )
-        # 카테고리를 먼저 복제합니다.
-        categories = [snap for snap in snapshots if snap["kind"] == "category"]
-        others = [snap for snap in snapshots if snap["kind"] != "category"]
-        for snap in categories:
-            new_category = await _create_channel_copy(guild, snap)
-            created.append(new_category)
-            channel_map[snap["id"]] = new_category
-        # 나머지 채널은 새 카테고리 안에 생성합니다.
-        for snap in others:
-            new_category = channel_map.get(snap["category_id"])
-            new_channel = await _create_channel_copy(guild, snap, category=new_category)
-            created.append(new_channel)
-            channel_map[snap["id"]] = new_channel
-
-        # 고정 메시지와 포럼 고정 게시글을 모두 복원합니다. 실패하면 원본은 그대로 둡니다.
-        for snap in others:
-            new_channel = channel_map[snap["id"]]
-            await _restore_channel_pins(new_channel, snap)
-
-        # 새 채널 복제와 고정 콘텐츠 복원이 끝난 후에만 원본을 삭제합니다.
-        delete_order = sorted(snapshots, key=lambda item: item["kind"] == "category")
-        delete_errors = []
-        for snap in delete_order:
-            try:
-                await snap["old"].delete(reason=f"/서버청소 (집행자: {interaction.user})")
-            except discord.HTTPException as exc:
-                delete_errors.append(f"{snap['name']}: {exc}")
-
-        # 원래의 채널/카테고리 배열을 복원합니다.
         try:
-            positions = {
-                channel_map[snap["id"]]: snap["position"]
-                for snap in snapshots
-                if snap["id"] in channel_map
-            }
-            await guild.edit_channel_positions(positions=positions, reason="낫또봇 서버 청소: 채널 순서 복원")
-        except (discord.HTTPException, AttributeError):
+            await interaction.followup.send(
+                "🧹 서버 메시지 청소를 시작했습니다. 채널과 저장된 설정은 유지됩니다.",
+                ephemeral=True,
+            )
+        except discord.HTTPException:
             pass
 
-        id_map = {old_id: new_channel.id for old_id, new_channel in channel_map.items()}
-        _remap_saved_channel_ids(guild.id, id_map)
-        if delete_errors:
-            sample = "\n".join(delete_errors[:8])
-            await interaction.followup.send(
-                f"⚠️ 새 채널과 고정 콘텐츠는 복원했지만, 일부 원본 채널을 삭제하지 못했습니다.\n"
-                f"봇 권한을 확인해 주세요:\n```{sample}```",
-                ephemeral=True,
-            )
-        else:
-            await interaction.followup.send(
-                f"✅ 서버 채널 재생성 완료!\n"
-                f"카테고리/채널 {len(snapshots)}개를 복제하고 채널 순서와 봇 내부 채널 설정 ID를 갱신했습니다.\n"
-                f"일반 메시지는 복사하지 않았고, 고정 메시지와 고정 포럼 포스트만 복원했습니다.",
-                ephemeral=True,
-            )
-    except Exception as exc:
-        # 복제나 고정 메시지 복원이 실패하면 원본은 아직 삭제하지 않았으므로 새로 만든 채널만 정리합니다.
-        await _delete_created_channels(created)
-        await interaction.followup.send(
-            f"❌ 서버 재생성 도중 오류가 발생했습니다. 원본 채널은 삭제 전 단계에서 중단했습니다.\n"
-            f"`{str(exc)[:1200]}`",
-            ephemeral=True,
+        # 1) 스레드 및 포럼 게시글 삭제. 채널 자체는 삭제하지 않습니다.
+        threads = await collect_all_threads(guild)
+        for thread in threads.values():
+            parent = thread.parent
+            if parent is None:
+                stats["skipped"] += 1
+                continue
+            perms = parent.permissions_for(guild.me)
+            if not perms.manage_threads:
+                stats["skipped"] += 1
+                continue
+            try:
+                await thread.delete(reason=f"/서버청소 (집행자: {interaction.user})")
+                stats["threads"] += 1
+            except discord.HTTPException:
+                stats["failed"] += 1
+
+        # 2) 텍스트/공지 채널의 메시지만 삭제. 채널과 설정 ID는 그대로 둡니다.
+        for channel in list(guild.text_channels):
+            perms = channel.permissions_for(guild.me)
+            if not (perms.view_channel and perms.manage_messages and perms.read_message_history):
+                stats["skipped"] += 1
+                continue
+            try:
+                deleted = await channel.purge(
+                    limit=None,
+                    bulk=True,
+                    reason=f"/서버청소 (집행자: {interaction.user})",
+                )
+                stats["messages"] += len(deleted)
+            except discord.HTTPException:
+                stats["failed"] += 1
+
+        embed = discord.Embed(
+            title="🧹 서버 메시지 청소 완료",
+            color=discord.Color.dark_red(),
+            timestamp=discord.utils.utcnow(),
         )
+        embed.add_field(name="💬 삭제한 메시지", value=f"{stats['messages']}개", inline=True)
+        embed.add_field(name="🧵 삭제한 스레드·포럼 게시글", value=f"{stats['threads']}개", inline=True)
+        embed.add_field(name="⏭️ 권한 부족/접근 불가", value=f"{stats['skipped']}곳", inline=True)
+        if stats["failed"]:
+            embed.add_field(name="⚠️ 오류로 실패", value=f"{stats['failed']}곳", inline=True)
+        embed.add_field(
+            name="🔒 유지되는 항목",
+            value="채널·카테고리·권한·채널 ID·낫또봇 설정(입장로그 포함)",
+            inline=False,
+        )
+        embed.set_footer(text="메시지와 게시글은 복구할 수 없습니다. 권한이 부족한 곳은 건너뛰었습니다.")
+        await interaction.followup.send(embed=embed, ephemeral=True)
+    except Exception as exc:
+        try:
+            await interaction.followup.send(
+                f"⚠️ 청소 도중 예상하지 못한 오류가 발생했습니다. 채널과 설정은 삭제하지 않았습니다.\n`{str(exc)[:1000]}`",
+                ephemeral=True,
+            )
+        except discord.HTTPException:
+            pass
     finally:
         RUNNING_CLEANS.discard(guild.id)
 
@@ -1488,7 +1519,7 @@ CATEGORY_WARN = {
     "인증": "`인증방`·`인증지급`·`인증메세지` 중 하나라도 비어 있으면 신입에게 안내가 안 뜨거나 역할을 못 줘서 **가입 단계가 멈춥니다.** (`인증방`이 없으면 `/인증완료`도 실행되지 않아요.)",
     "제재": "`제재로그`가 비어 있으면 **`/제재`·`/제재지우기`를 쓸 수 없고**, 자동 제재는 처리돼도 로그가 남지 않습니다.",
     "입퇴장": "로그 채널을 정하지 않으면 해당 입장/퇴장 기록이 남지 않습니다.",
-    "청소": "삭제는 **되돌릴 수 없습니다.** 반드시 ✅/❌ 확인을 거치며, 봇에 '메시지 관리' 권한이 필요합니다.",
+    "청소": "삭제는 **되돌릴 수 없습니다.** `/서버청소`는 채널·카테고리·입장로그 설정을 유지하지만 메시지·스레드·포럼 게시글은 삭제합니다.",
     "기타": "",
 }
 
@@ -1572,17 +1603,46 @@ async def guide_cb(interaction: discord.Interaction):
     app_commands.Choice(name="日本語", value="ja"),
     app_commands.Choice(name="한국어", value="ko"),
 ])
-@app_commands.describe(언어="번역 결과 언어를 선택하세요.", 내용="번역할 문장을 입력하세요.")
+@app_commands.describe(언어="번역 결과 언어를 선택하세요.", 내용="번역할 문장이나 약자/신조어를 입력하세요.")
 @app_commands.guild_only()
 async def translate_cb(interaction: discord.Interaction, 언어: app_commands.Choice[str], 내용: str):
     text_to_translate = 내용.strip()
     if not text_to_translate:
-        await interaction.response.send_message("번역할 문장을 입력해 주세요.", ephemeral=True)
+        await interaction.response.send_message("번역할 문장이나 약자를 입력해 주세요.", ephemeral=True)
         return
     if len(text_to_translate) > 1500:
         await interaction.response.send_message("한 번에 최대 1,500자까지 번역할 수 있습니다.", ephemeral=True)
         return
 
+    # 자주 쓰는 영어 채팅/게임 약자를 뜻이 분명한 영어 표현으로 먼저 풀어 씁니다.
+    # 예: ty -> thank you, gg -> good game, ez -> easy
+    slang_meanings = {
+        "ty": "thank you", "thx": "thanks", "tx": "thanks",
+        "gg": "good game", "ggs": "good games", "ggwp": "good game, well played",
+        "wp": "well played", "ez": "easy", "ezz": "easy",
+        "np": "no problem", "nvm": "never mind", "yw": "you're welcome",
+        "pls": "please", "plz": "please", "ppl": "people",
+        "brb": "be right back", "afk": "away from keyboard",
+        "idk": "I don't know", "ikr": "I know, right", "imo": "in my opinion",
+        "imho": "in my humble opinion", "tbh": "to be honest", "ngl": "not gonna lie",
+        "btw": "by the way", "fyi": "for your information", "asap": "as soon as possible",
+        "omg": "oh my god", "lol": "laughing out loud", "lmao": "that's hilarious",
+        "rofl": "rolling on the floor laughing", "smh": "shaking my head",
+        "rn": "right now", "fr": "for real", "irl": "in real life",
+        "wyd": "what are you doing", "wdym": "what do you mean", "wym": "what do you mean",
+        "hbu": "how about you", "wbu": "what about you", "jk": "just kidding",
+        "gl": "good luck", "hf": "have fun", "glhf": "good luck, have fun",
+        "omw": "on my way", "ttyl": "talk to you later", "cya": "see you",
+        "bc": "because", "b/c": "because", "u": "you", "ur": "your",
+        "r": "are", "thx": "thanks", "k": "okay", "kk": "okay",
+    }
+
+    def expand_slang(value: str) -> str:
+        # 단어 경계를 기준으로 치환해 다른 단어 안의 글자는 바꾸지 않습니다.
+        pattern = re.compile(r"(?<!\w)([A-Za-z]+(?:/[A-Za-z]+)?)(?!\w)")
+        return pattern.sub(lambda match: slang_meanings.get(match.group(1).lower(), match.group(1)), value)
+
+    expanded_text = expand_slang(text_to_translate)
     language_names = {"en": "English", "ja": "日本語", "ko": "한국어"}
     await interaction.response.defer(thinking=True)
     try:
@@ -1593,7 +1653,7 @@ async def translate_cb(interaction: discord.Interaction, 언어: app_commands.Ch
             "sl": "auto",
             "tl": 언어.value,
             "dt": "t",
-            "q": text_to_translate,
+            "q": expanded_text,
         }
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.get(url, params=params) as response:
@@ -1610,6 +1670,8 @@ async def translate_cb(interaction: discord.Interaction, 언어: app_commands.Ch
             color=discord.Color.blurple(),
         )
         embed.add_field(name="원문", value=text_to_translate[:1024], inline=False)
+        if expanded_text.casefold() != text_to_translate.casefold():
+            embed.add_field(name="약자 풀이", value=expanded_text[:1024], inline=False)
         embed.description = translated[:4000]
         await interaction.followup.send(embed=embed)
     except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, IndexError, TypeError) as exc:
@@ -1717,12 +1779,12 @@ FEATURES = {
         "top": clean_channel_cb,
     },
     "서버청소": {
-        "cat": "청소", "desc": "서버 채널/카테고리를 같은 설정과 순서로 재생성하고 고정 메시지/포럼 포스트를 복원합니다. (관리자, 확인 필요)", "usage": "",
+        "cat": "청소", "desc": "채널·카테고리와 낫또봇 설정은 유지하고 메시지·스레드·포럼 게시글만 삭제합니다. (관리자, 확인 필요)", "usage": "",
         "top": clean_server_cb,
     },
     # ---------- 기타 ----------
     "번역": {
-        "cat": "기타", "desc": "입력한 문장을 영어·일본어·한국어로 번역합니다. (모든 사용자 사용 가능)", "usage": "`언어` `내용`",
+        "cat": "기타", "desc": "문장과 ty·gg·ez 같은 약자/게임 신조어도 뜻을 풀어 영어·일본어·한국어로 번역합니다. (모든 사용자 사용 가능)", "usage": "`언어` `내용`",
         "top": translate_cb,
     },
     "가이드": {
