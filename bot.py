@@ -33,7 +33,7 @@ def keep_alive():
 # Render 등에서 Persistent Disk를 쓰면 DATA_DIR 환경변수에 마운트 경로(예: /data)를 넣어 주세요.
 DATA_DIR = os.getenv("DATA_DIR", ".")
 DATA_FILE = os.path.join(DATA_DIR, "guild_settings.json")
-COMMAND_VERSION = 5   # 전역 명령어 구성이 바뀔 때만 올리면 시작 시 1회 동기화됩니다.
+COMMAND_VERSION = 6   # 오래된 전역/서버 명령어 정리를 위해 버전을 올립니다.
 META = {}
 
 def load_settings():
@@ -145,340 +145,71 @@ async def require_setting_channel(interaction: discord.Interaction, key: str, ac
 CONFIRM_TIMEOUT = 60
 
 async def confirm_by_reaction(interaction: discord.Interaction, warn_text: str, action: str) -> bool:
-    """경고 메시지를 띄우고 ✅면 True, ❌/시간초과/오류면 False를 반환합니다. (명령어 입력자만 선택 가능)"""
-    await interaction.response.send_message(warn_text)
-    warn_msg = await interaction.original_response()
+    """버튼으로 확인합니다. 반응 인텐트/이모지 권한에 의존하지 않습니다."""
+    class ConfirmView(discord.ui.View):
+        def __init__(self):
+            super().__init__(timeout=CONFIRM_TIMEOUT)
+            self.value = None
 
-    async def delete_warning():
-        try:
-            await interaction.delete_original_response()
-        except discord.HTTPException:
-            pass
-
-    async def notice(text: str):
-        try:
-            await interaction.channel.send(text, delete_after=5)
-        except (discord.HTTPException, AttributeError):
-            pass
-
-    try:
-        await warn_msg.add_reaction("✅")
-        await warn_msg.add_reaction("❌")
-    except discord.HTTPException:
-        await delete_warning()
-        await interaction.followup.send("❌ 반응(이모지)을 추가할 권한이 없어 진행할 수 없습니다. 봇에 '반응 추가하기', '메시지 기록 보기' 권한을 주세요.", ephemeral=True)
-        return False
-
-    def check(payload: discord.RawReactionActionEvent):
-        return (
-            payload.message_id == warn_msg.id
-            and payload.user_id == interaction.user.id
-            and str(payload.emoji) in ("✅", "❌")
-        )
-
-    try:
-        payload = await bot.wait_for("raw_reaction_add", check=check, timeout=CONFIRM_TIMEOUT)
-    except asyncio.TimeoutError:
-        await delete_warning()
-        await notice(f"⏰ {interaction.user.mention} 시간이 초과되어 {action}{josa(action, '이', '가')} 취소되었습니다.")
-        return False
-
-    await delete_warning()
-    if str(payload.emoji) == "✅":
-        return True
-    await notice(f"🚫 {interaction.user.mention} {action}{josa(action, '이', '가')} 거절(취소)되었습니다. 기존 상태는 그대로 유지됩니다.")
-    return False
-
-# ================= [ 공통 제재 및 전과 추가 로직 ] =================
-async def punish_user(guild: discord.Guild, member: discord.Member, reason: str, punisher: str = "시스템 자동 검열") -> bool:
-    if not guild or not member:
-        return False
-
-    log_channel = None
-    log_channel_id = GUILD_SETTINGS.get(guild.id, {}).get("punish_log_channel")
-    if log_channel_id:
-        log_channel = guild.get_channel(log_channel_id)
-
-    async def send_log(**kwargs):
-        if not log_channel:
-            return
-        try:
-            await log_channel.send(**kwargs)
-        except discord.HTTPException:
-            pass
-
-    if member.top_role >= guild.me.top_role:
-        embed = discord.Embed(title="❌ 제재 권한 실패 경고", color=discord.Color.dark_red())
-        embed.description = f"봇의 역할 순위가 대상 유저({member.mention})보다 낮거나 같아 제재할 수 없습니다."
-        await send_log(embed=embed)
-        return False
-
-    current_count = 0
-    roles_to_remove = []
-    for r in member.roles:
-        if r.name.startswith("전과 ") and r.name.endswith("범"):
-            try:
-                current_count = int(r.name.replace("전과 ", "").replace("범", "").strip())
-                roles_to_remove.append(r)
-            except ValueError:
-                continue
-
-    current_count += 1
-
-    try:
-        if current_count >= 20:
-            await member.ban(reason=f"전과 20범 달성 ({reason})"[:512])
-            embed = discord.Embed(title="🚨 유저 영구 차단 (BAN)", color=discord.Color.red(), timestamp=discord.utils.utcnow())
-            embed.add_field(name="👤 대상자", value=f"{member.mention} ({member.name})", inline=True)
-            embed.add_field(name="🔨 집행자", value=str(punisher), inline=True)
-            embed.add_field(name="💬 최종 사유", value=reason[:1024], inline=False)
-            await send_log(embed=embed)
+        async def interaction_check(self, button_interaction: discord.Interaction) -> bool:
+            if button_interaction.user.id != interaction.user.id:
+                await button_interaction.response.send_message(
+                    "이 확인 버튼은 명령어를 실행한 사람만 사용할 수 있습니다.", ephemeral=True
+                )
+                return False
             return True
 
-        punish_days = min(current_count, 28)
-        duration = datetime.timedelta(days=punish_days)
-        target_time = discord.utils.utcnow() + duration
-        await member.edit(timed_out_until=target_time, reason=f"전과 {current_count}범 제재 ({reason})"[:512])
+        @discord.ui.button(label="진행", style=discord.ButtonStyle.danger, emoji="✅")
+        async def confirm(self, button_interaction: discord.Interaction, button: discord.ui.Button):
+            self.value = True
+            await button_interaction.response.defer()
+            self.stop()
 
-        role_name = f"전과 {current_count}범"
-        role = discord.utils.get(guild.roles, name=role_name)
-        if not role:
-            try:
-                role = await guild.create_role(name=role_name, reason="전과 시스템 자동 생성")
-            except discord.HTTPException as e:
-                await send_log(content=f"❌ **역할 생성 실패 (서버 제한 초과 가능성):** `{e.text}`")
-                return True
+        @discord.ui.button(label="취소", style=discord.ButtonStyle.secondary, emoji="❌")
+        async def cancel(self, button_interaction: discord.Interaction, button: discord.ui.Button):
+            self.value = False
+            await button_interaction.response.defer()
+            self.stop()
 
-        if roles_to_remove:
-            await member.remove_roles(*roles_to_remove)
-        await member.add_roles(role)
-
-        embed = discord.Embed(title="⚠️ 유저 제재 알림", color=discord.Color.orange(), timestamp=discord.utils.utcnow())
-        embed.add_field(name="👤 대상자", value=f"{member.mention} ({member.name})", inline=True)
-        embed.add_field(name="🔨 집행자", value=str(punisher), inline=True)
-        embed.add_field(name="📜 조치 내용", value=f"**{role_name}** 부여 및 **{punish_days}일간** 타임아웃", inline=False)
-        embed.add_field(name="💬 제재 사유", value=reason[:1024], inline=False)
-        await send_log(embed=embed)
-        return True
-
-    except discord.Forbidden:
-        embed = discord.Embed(title="❌ 제재 권한 실패 경고", color=discord.Color.dark_red())
-        embed.description = f"봇의 역할 순위가 {member.mention}님보다 낮아 제재 처리에 실패했습니다. 서버 설정에서 봇 역할을 위로 올려주세요."
-        await send_log(embed=embed)
-        return False
-    except Exception as e:
-        await send_log(content=f"❌ **제재 실행 중 시스템 에러 발생:** `{e}`")
-        return False
-
-async def send_punish_log(guild: discord.Guild, embed: discord.Embed):
-    """제재 로그 채널이 설정돼 있으면 기록을 남깁니다. (없어도 본 작업은 정상 처리)"""
-    log_channel_id = GUILD_SETTINGS.get(guild.id, {}).get("punish_log_channel")
-    log_channel = guild.get_channel(log_channel_id) if log_channel_id else None
-    if log_channel:
+    view = ConfirmView()
+    await interaction.response.send_message(warn_text, view=view)
+    try:
+        await view.wait()
+    except Exception as exc:
+        print(f"확인 버튼 처리 오류: {exc}")
         try:
-            await log_channel.send(embed=embed)
+            await interaction.followup.send(
+                f"❌ 확인 절차에서 오류가 발생해 {action}을(를) 취소했습니다. 기존 상태는 변경하지 않았습니다.",
+                ephemeral=True,
+            )
         except discord.HTTPException:
             pass
+        return False
 
-# ================= [ 이벤트 처리 ] =================
-_startup_done = False
-
-@bot.event
-async def on_ready():
-    global _startup_done
-    print(f"🤖 {bot.user.name} 봇이 가동되었습니다.")
-    if _startup_done:
-        return
-    _startup_done = True
-
-    force = os.getenv("SYNC_COMMANDS") == "1"
-    version_changed = META.get("synced_version") != COMMAND_VERSION
-    # 전역 명령어 구성이 바뀌었을 때는 기존 활성화 서버의 명령어도 한 번 갱신합니다.
-    if force or version_changed:
-        try:
-            synced = await bot.tree.sync()
-            META["synced_version"] = COMMAND_VERSION
-            save_settings(GUILD_SETTINGS)
-            print(f"🔗 전역 슬래시 명령어 {len(synced)}개 동기화 완료")
-        except Exception as e:
-            print(f"❌ 슬래시 명령어 동기화 실패: {e}")
-        for gid, gs in list(GUILD_SETTINGS.items()):
-            guild = bot.get_guild(gid)
-            if guild and gs.get("enabled"):
-                try:
-                    await refresh_guild_commands(guild)
-                    print(f"🔗 {gid} 서버 명령어 동기화 완료")
-                except Exception as e:
-                    print(f"❌ {gid} 서버 명령어 동기화 실패: {e}")
-
-@bot.event
-async def on_guild_join(guild: discord.Guild):
-    for channel in guild.text_channels:
-        perms = channel.permissions_for(guild.me)
-        if perms.send_messages and perms.create_public_threads:
-            try:
-                msg = await channel.send("🛡️ **낫또봇이 입장했습니다!**")
-                thread = await msg.create_thread(
-                    name="🛡️ 낫또봇 시작 가이드",
-                    auto_archive_duration=1440,
-                    reason="초기 입장 가이드 제공"
-                )
-                embed = discord.Embed(
-                    title="⚙️ 낫또봇 시작하기",
-                    description="처음에는 **`/활성화`** 명령어 하나만 보여요. 필요한 기능만 골라 켜서 쓰세요!",
-                    color=discord.Color.blurple()
-                )
-                embed.add_field(
-                    name="1️⃣ 기능 켜기",
-                    value="`/활성화` → 카테고리(인증·제재·입퇴장·청소·기타) → 기능 선택 → Enter\n카테고리의 `전체`를 고르면 한 번에 켤 수 있어요.",
-                    inline=False
-                )
-                embed.add_field(
-                    name="2️⃣ 설정하기",
-                    value="`/설정` → 카테고리 → 기능 → 값 입력\n(켜 둔 기능만 목록에 나타나요)",
-                    inline=False
-                )
-                embed.add_field(
-                    name="📖 자세한 사용법",
-                    value="`/활성화 기타 가이드` 로 가이드를 켠 뒤 `/가이드`를 입력하세요.",
-                    inline=False
-                )
-                await thread.send(embed=embed)
-                break
-            except Exception:
-                continue
-
-@bot.event
-async def on_member_join(member: discord.Member):
-    guild_id = member.guild.id
-    settings = GUILD_SETTINGS.get(guild_id)
-    if not settings:
-        return
-
-    auth_channel_id = settings.get("auth_channel")
-    auth_form = settings.get("auth_form")
-
-    if is_on(guild_id, "인증방") and auth_channel_id and auth_form:
-        auth_channel = member.guild.get_channel(auth_channel_id)
-        if auth_channel:
-            converted_form = auth_form.replace("\\n", "\n")
-            try:
-                await auth_channel.send(f"👋 {member.mention}님, 서버에 오신 것을 환영합니다!\n{converted_form}")
-            except discord.HTTPException:
-                pass
-
-    join_log_id = settings.get("join_log_channel")
-    if is_on(guild_id, "입장로그") and join_log_id:
-        try:
-            join_log_channel = member.guild.get_channel(int(join_log_id))
-        except (TypeError, ValueError):
-            join_log_channel = None
-
-        # 이전 서버청소에서 저장된 ID가 낡았을 경우, 저장된 채널 이름으로 자동 복구합니다.
-        if join_log_channel is None:
-            saved_name = settings.get("join_log_channel_name")
-            candidate_names = [saved_name, "입장로그", "입장-로그", "join-log", "join_log", "joinlog"]
-            normalized_names = {name.casefold() for name in candidate_names if isinstance(name, str) and name.strip()}
-            join_log_channel = next(
-                (ch for ch in member.guild.text_channels if ch.name.casefold() in normalized_names),
-                None,
-            )
-            if join_log_channel is not None:
-                settings["join_log_channel"] = join_log_channel.id
-                settings["join_log_channel_name"] = join_log_channel.name
-                save_settings(GUILD_SETTINGS)
-
-        if join_log_channel:
-            now = datetime.datetime.now().strftime('%Y년 %m월 %d일 %H시 %M분')
-            created_at = member.created_at.strftime('%Y년 %m월 %d일 %H시 %M분')
-            embed = discord.Embed(title="📥 유저 서버 입장", color=discord.Color.green())
-            embed.add_field(name="👤 대상 유저", value=f"{member.mention} ({member.name})", inline=False)
-            embed.add_field(name="⏰ 입장 시간", value=now, inline=True)
-            embed.add_field(name="📅 계정 생성일", value=created_at, inline=True)
-            embed.set_thumbnail(url=(member.avatar or member.default_avatar).url)
-            try:
-                await join_log_channel.send(embed=embed)
-            except discord.HTTPException:
-                pass
-
-@bot.event
-async def on_member_remove(member: discord.Member):
-    guild_id = member.guild.id
-    if not is_on(guild_id, "퇴장로그"):
-        return
-    leave_log_id = GUILD_SETTINGS.get(guild_id, {}).get("leave_log_channel")
-    if leave_log_id:
-        leave_log_channel = member.guild.get_channel(leave_log_id)
-        if leave_log_channel:
-            embed = discord.Embed(title="📤 유저 서버 퇴장", color=discord.Color.red())
-            embed.add_field(name="👤 퇴장 유저", value=f"{member.name} (ID: {member.id})", inline=False)
-            embed.set_thumbnail(url=(member.avatar or member.default_avatar).url)
-            try:
-                await leave_log_channel.send(embed=embed)
-            except discord.HTTPException:
-                pass
-
-# ================= [ 실시간 문자 검열 및 자동 제재 엔진 ] =================
-@bot.event
-async def on_message(message: discord.Message):
-    if message.author.bot or not message.guild:
-        return
-
-    guild_id = message.guild.id
-    settings = GUILD_SETTINGS.get(guild_id, {})
-
-    if is_on(guild_id, "제재단어"):
-        for word in settings.get("ban_words", []):
-            if word in message.content:
-                try:
-                    await message.delete()
-                except discord.HTTPException:
-                    pass
-                reason = f"자동 제재 대상 단어 [{word}] 포함 문장 작성"
-                await punish_user(message.guild, message.author, f"{reason}\n포착된 메시지: ||{message.content}||", "시스템 자동 검열")
-                return
-
-    if is_on(guild_id, "검열단어"):
-        for word in settings.get("censor_words", []):
-            if word in message.content:
-                try:
-                    await message.delete()
-                except discord.HTTPException:
-                    pass
-                await message.channel.send(f"⚠️ {message.author.mention}님의 메시지가 검열 대상 단어 포함으로 삭제되었습니다.")
-                return
-
-    await bot.process_commands(message)
-
-# ================= [ 슬래시 명령어 전역 에러 핸들러 ] =================
-async def _reply(interaction: discord.Interaction, text: str):
     try:
-        if interaction.response.is_done():
-            await interaction.followup.send(text, ephemeral=True)
-        else:
-            await interaction.response.send_message(text, ephemeral=True)
+        await interaction.edit_original_response(view=None)
     except discord.HTTPException:
         pass
 
-@bot.tree.error
-async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    if isinstance(error, app_commands.MissingPermissions):
-        await _reply(interaction, "❌ 이 명령어를 사용할 권한이 없습니다.")
-    elif isinstance(error, app_commands.BotMissingPermissions):
-        await _reply(interaction, "❌ 봇에게 필요한 권한이 부족하여 명령어를 실행할 수 없습니다.")
-    elif isinstance(error, app_commands.CommandNotFound):
-        await _reply(interaction, "⚠️ 이 명령어는 현재 비활성화 상태입니다. `/활성화` 로 다시 켜 주세요.")
-    elif isinstance(error, app_commands.CheckFailure):
-        await _reply(interaction, "❌ 이 명령어를 사용할 수 없습니다.")
-    else:
-        original = getattr(error, "original", error)
-        print("슬래시 명령어 오류 발생:")
-        traceback.print_exception(type(original), original, original.__traceback__)
-        await _reply(interaction, "❌ 명령어를 처리하는 중 알 수 없는 시스템 오류가 발생했습니다.")
+    if view.value is True:
+        return True
+    if view.value is False:
+        try:
+            await interaction.followup.send(
+                f"🚫 {action}이(가) 취소되었습니다. 기존 상태는 그대로 유지됩니다.", ephemeral=True
+            )
+        except discord.HTTPException:
+            pass
+        return False
 
-# ====================================================================
-# ⚙️ 설정 · 제거 · 체크 · 초기화 콜백 (팩토리)
-# ====================================================================
+    try:
+        await interaction.followup.send(
+            f"⏰ {CONFIRM_TIMEOUT}초 동안 선택하지 않아 {action}이(가) 자동 취소되었습니다.",
+            ephemeral=True,
+        )
+    except discord.HTTPException:
+        pass
+    return False
 
 # ---------- 채널 설정 ----------
 def make_set_channel(store: str, label: str):
