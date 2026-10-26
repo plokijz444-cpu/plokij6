@@ -2001,18 +2001,24 @@ async def give_role_cb(interaction: discord.Interaction, 대상: discord.Member,
     except discord.Forbidden:
         await interaction.response.send_message("❌ 봇의 역할 순위 또는 권한이 부족합니다.", ephemeral=True)
 
+def _with_default_permissions(command: app_commands.Command, permissions: discord.Permissions) -> app_commands.Command:
+    """Apply Discord command default permissions using discord.py's decorator API."""
+    permission_names = ("administrator", "manage_roles", "moderate_members", "ban_members")
+    kwargs = {name: True for name in permission_names if getattr(permissions, name, False)}
+    return app_commands.default_permissions(**kwargs)(command)
+
 def build_guild_commands(guild_id: int) -> list:
     enabled = enabled_keys(guild_id)
     if not enabled:
         return []
     admin_permissions = discord.Permissions(administrator=True)
     result = [
-        app_commands.Command(name="설정", description="기능을 선택해 값을 설정합니다.", callback=generic_set_cb, default_permissions=admin_permissions),
-        app_commands.Command(name="체크", description="기능의 현재 설정을 확인합니다.", callback=generic_check_cb, default_permissions=admin_permissions),
-        app_commands.Command(name="제거", description="기능의 설정 또는 목록 항목을 제거합니다.", callback=generic_remove_cb, default_permissions=admin_permissions),
-        app_commands.Command(name="초기화", description="기능의 목록을 초기화합니다.", callback=generic_reset_cb, default_permissions=admin_permissions),
-        app_commands.Command(name="비활성화", description="켜 둔 기능을 끕니다.", callback=deactivate_cb, default_permissions=admin_permissions),
-        app_commands.Command(name="역할주기", description="선택한 멤버에게 역할을 지급합니다.", callback=give_role_cb, default_permissions=discord.Permissions(manage_roles=True)),
+        _with_default_permissions(app_commands.Command(name="설정", description="기능을 선택해 값을 설정합니다.", callback=generic_set_cb), admin_permissions),
+        _with_default_permissions(app_commands.Command(name="체크", description="기능의 현재 설정을 확인합니다.", callback=generic_check_cb), admin_permissions),
+        _with_default_permissions(app_commands.Command(name="제거", description="기능의 설정 또는 목록 항목을 제거합니다.", callback=generic_remove_cb), admin_permissions),
+        _with_default_permissions(app_commands.Command(name="초기화", description="기능의 목록을 초기화합니다.", callback=generic_reset_cb), admin_permissions),
+        _with_default_permissions(app_commands.Command(name="비활성화", description="켜 둔 기능을 끕니다.", callback=deactivate_cb), admin_permissions),
+        _with_default_permissions(app_commands.Command(name="역할주기", description="선택한 멤버에게 역할을 지급합니다.", callback=give_role_cb), discord.Permissions(manage_roles=True)),
     ]
     command_permissions = {
         "인증완료": discord.Permissions(manage_roles=True),
@@ -2026,15 +2032,15 @@ def build_guild_commands(guild_id: int) -> list:
     public_commands = {"번역", "가이드"}
     for k, f in FEATURES.items():
         if k in enabled and "top" in f:
-            kwargs = {}
+            command = app_commands.Command(
+                name=k, description=f["desc"][:100], callback=f["top"]
+            )
             if k in command_permissions:
-                kwargs["default_permissions"] = command_permissions[k]
+                command = _with_default_permissions(command, command_permissions[k])
             elif k not in public_commands:
                 # 기능 관리/운영 명령어는 관리자 권한이 없는 계정의 목록에 노출하지 않습니다.
-                kwargs["default_permissions"] = admin_permissions
-            result.append(app_commands.Command(
-                name=k, description=f["desc"][:100], callback=f["top"], **kwargs
-            ))
+                command = _with_default_permissions(command, admin_permissions)
+            result.append(command)
     return result
 
 def register_guild_commands(guild_id: int) -> discord.Object:
@@ -2123,7 +2129,7 @@ async def deactivate_cb(interaction: discord.Interaction, 기능: str):
     await interaction.followup.send(f"⛔ **{기능}** 기능을 비활성화했습니다. 저장된 설정값은 남아 있으니 `/활성화`에서 『{FEATURES[기능]['cat']}』 {기능} 선택 로 다시 켜면 그대로 쓸 수 있어요.")
 
 def build_activation_group() -> app_commands.Command:
-    return app_commands.Command(name="활성화", description="사용할 기능을 검색해 하나씩 활성화합니다.", callback=generic_activate_cb, default_permissions=discord.Permissions(administrator=True))
+    return _with_default_permissions(app_commands.Command(name="활성화", description="사용할 기능을 검색해 하나씩 활성화합니다.", callback=generic_activate_cb), discord.Permissions(administrator=True))
 
 @app_commands.guild_only()
 @admin_only
@@ -2131,7 +2137,7 @@ async def activate_all_cb(interaction: discord.Interaction):
     await activate_features(interaction, list(FEATURES.keys()))
 
 def build_activate_all_command() -> app_commands.Command:
-    return app_commands.Command(name="모두활성화", description="모든 기능을 한 번에 활성화합니다.", callback=activate_all_cb, default_permissions=discord.Permissions(administrator=True))
+    return _with_default_permissions(app_commands.Command(name="모두활성화", description="모든 기능을 한 번에 활성화합니다.", callback=activate_all_cb), discord.Permissions(administrator=True))
 
 @app_commands.guild_only()
 @admin_only
@@ -2158,7 +2164,7 @@ async def deactivate_all_cb(interaction: discord.Interaction):
     await interaction.followup.send(f"⛔ 전체 기능 {len(old)}개를 비활성화했습니다. 저장된 설정값은 유지됩니다.")
 
 def build_deactivate_all_command() -> app_commands.Command:
-    return app_commands.Command(name="모두비활성화", description="모든 기능을 한 번에 비활성화합니다.", callback=deactivate_all_cb, default_permissions=discord.Permissions(administrator=True))
+    return _with_default_permissions(app_commands.Command(name="모두비활성화", description="모든 기능을 한 번에 비활성화합니다.", callback=deactivate_all_cb), discord.Permissions(administrator=True))
 
 # ================= [ 실행 ] =================
 if __name__ == "__main__":
