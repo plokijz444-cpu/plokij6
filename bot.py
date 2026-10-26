@@ -9,6 +9,8 @@ import os
 import json
 import tempfile
 import traceback
+import io
+import aiohttp
 
 # ================= [ Render 24시간 가동을 위한 웹서버 ] =================
 app = Flask('')
@@ -30,7 +32,7 @@ def keep_alive():
 # Render 등에서 Persistent Disk를 쓰면 DATA_DIR 환경변수에 마운트 경로(예: /data)를 넣어 주세요.
 DATA_DIR = os.getenv("DATA_DIR", ".")
 DATA_FILE = os.path.join(DATA_DIR, "guild_settings.json")
-COMMAND_VERSION = 3   # 전역 명령어 구성이 바뀔 때만 올리면 시작 시 1회 동기화됩니다.
+COMMAND_VERSION = 4   # 전역 명령어 구성이 바뀔 때만 올리면 시작 시 1회 동기화됩니다.
 META = {}
 
 def load_settings():
@@ -289,8 +291,9 @@ async def on_ready():
     _startup_done = True
 
     force = os.getenv("SYNC_COMMANDS") == "1"
-    # 명령어 동기화는 요청 수가 많아 IP 차단(레이트 리밋)의 원인이 되므로, 필요할 때만 합니다.
-    if force or META.get("synced_version") != COMMAND_VERSION:
+    version_changed = META.get("synced_version") != COMMAND_VERSION
+    # 전역 명령어 구성이 바뀌었을 때는 기존 활성화 서버의 명령어도 한 번 갱신합니다.
+    if force or version_changed:
         try:
             synced = await bot.tree.sync()
             META["synced_version"] = COMMAND_VERSION
@@ -298,12 +301,12 @@ async def on_ready():
             print(f"🔗 전역 슬래시 명령어 {len(synced)}개 동기화 완료")
         except Exception as e:
             print(f"❌ 슬래시 명령어 동기화 실패: {e}")
-    if force:
         for gid, gs in list(GUILD_SETTINGS.items()):
             guild = bot.get_guild(gid)
             if guild and gs.get("enabled"):
                 try:
-                    await bot.tree.sync(guild=discord.Object(id=gid))
+                    await refresh_guild_commands(guild)
+                    print(f"🔗 {gid} 서버 명령어 동기화 완료")
                 except Exception as e:
                     print(f"❌ {gid} 서버 명령어 동기화 실패: {e}")
 
@@ -959,151 +962,526 @@ async def unban_member_cb(interaction: discord.Interaction):
     await interaction.followup.send(embed=view.make_embed(), view=view)
     view.interaction = interaction
 
+
 # ---------- 청소 / 서버청소 ----------
 RUNNING_CLEANS = set()   # 서버별 동시 청소 방지
 
-@app_commands.default_permissions(manage_messages=True)
-@app_commands.guild_only()
-@app_commands.checks.has_permissions(manage_messages=True)
-async def clean_channel_cb(interaction: discord.Interaction):
-    channel = interaction.channel
-    guild = interaction.guild
-    if not isinstance(channel, (discord.TextChannel, discord.Thread, discord.VoiceChannel, discord.StageChannel)):
-        await interaction.response.send_message("❌ 이 채널에서는 청소를 사용할 수 없습니다.", ephemeral=True)
-        return
-    perms = channel.permissions_for(guild.me)
-    if not (perms.manage_messages and perms.read_message_history):
-        await interaction.response.send_message("❌ 봇에게 '메시지 관리'와 '메시지 기록 보기' 권한이 필요합니다.", ephemeral=True)
-        return
-    if guild.id in RUNNING_CLEANS:
-        await interaction.response.send_message("⏳ 이 서버에서 이미 청소가 진행 중입니다. 끝난 뒤 다시 시도해 주세요.", ephemeral=True)
-        return
+def _is_category_channel(channel):
+    return isinstance(channel, discord.CategoryChannel)
 
-    warn_text = (
-        f"🧹 **경고: 채널 전체 청소**\n"
-        f"{interaction.user.mention}님, {channel.mention} 의 **모든 메세지(고정 메세지 포함)** 가 삭제되며 되돌릴 수 없습니다.\n"
-        f"메세지가 많거나 오래됐다면 시간이 오래 걸릴 수 있습니다.\n\n"
-        f"✅ 를 누르면 **청소 진행** / ❌ 를 누르면 **취소**\n"
-        f"(명령어를 입력한 본인만 선택할 수 있으며, {CONFIRM_TIMEOUT}초 안에 선택하지 않으면 자동 취소됩니다.)"
-    )
-    if not await confirm_by_reaction(interaction, warn_text, "채널 청소"):
-        return
+def _channel_kind(channel):
+    """채널 복제에 지원하는 채널 유형을 반환합니다."""
+    if isinstance(channel, discord.CategoryChannel):
+        return "category"
+    if hasattr(discord, "ForumChannel") and isinstance(channel, discord.ForumChannel):
+        return "forum"
+    if hasattr(discord, "StageChannel") and isinstance(channel, discord.StageChannel):
+        return "stage"
+    if hasattr(discord, "NewsChannel") and isinstance(channel, discord.NewsChannel):
+        return "news"
+    if isinstance(channel, discord.TextChannel):
+        return "text"
+    if isinstance(channel, discord.VoiceChannel):
+        return "voice"
+    return None
 
-    RUNNING_CLEANS.add(guild.id)
-    result = None
+async def _snapshot_message(message, guild):
+    """메시지 내용/임베드/첨부파일을 원본 채널 삭제 전에 메모리에 복사합니다."""
+    files = []
+    for attachment in message.attachments:
+        limit = getattr(guild, "filesize_limit", 8 * 1024 * 1024)
+        if attachment.size > limit:
+            raise RuntimeError(
+                f"첨부파일 '{attachment.filename}'이 서버 업로드 제한({limit}바이트)을 초과합니다."
+            )
+        data = await attachment.read()
+        files.append({
+            "filename": attachment.filename,
+            "description": getattr(attachment, "description", None),
+            "data": data,
+            "spoiler": attachment.is_spoiler(),
+        })
+    return {
+        "content": message.content or None,
+        "embeds": [embed.to_dict() for embed in message.embeds],
+        "files": files,
+        "was_pinned": bool(getattr(message, "pinned", False)),
+        "created_at": message.created_at,
+    }
+
+async def _send_message_snapshot(destination, snapshot, *, pin=False):
+    files = [
+        discord.File(
+            io.BytesIO(item["data"]),
+            filename=item["filename"],
+            description=item["description"],
+            spoiler=item["spoiler"],
+        )
+        for item in snapshot.get("files", [])
+    ]
+    embeds = [discord.Embed.from_dict(item) for item in snapshot.get("embeds", [])[:10]]
+    content = snapshot.get("content")
+    if not content and not embeds and not files:
+        content = "‎"  # 빈 메시지 형태의 고정 메시지도 복원할 수 있도록 보이지 않는 문자 사용
     try:
-        deleted = await channel.purge(limit=None, bulk=True, reason=f"/청소 (집행자: {interaction.user.name})")
-        result = f"🧹 {channel.mention} 의 메세지 **{len(deleted)}개**를 삭제했습니다."
-    except discord.Forbidden:
-        result = "❌ 권한이 부족해 청소를 끝까지 진행하지 못했습니다."
-    except discord.HTTPException as e:
-        result = f"❌ 청소 중 오류가 발생했습니다: `{e}`"
-    finally:
-        RUNNING_CLEANS.discard(guild.id)
+        message = await destination.send(
+            content=content,
+            embeds=embeds,
+            files=files,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+    except Exception:
+        for file in files:
+            try:
+                file.close()
+            except Exception:
+                pass
+        raise
+    if pin:
+        await message.pin(reason="낫또봇 채널 청소: 기존 고정 메시지 복원")
+    return message
 
+async def _get_forum_threads(forum):
+    """포럼 채널의 활성/보관 게시글을 모읍니다."""
+    threads = {thread.id: thread for thread in getattr(forum, "threads", [])}
     try:
-        await interaction.followup.send(result, ephemeral=True)
-    except discord.HTTPException:
+        async for thread in forum.archived_threads(limit=None):
+            threads[thread.id] = thread
+    except discord.HTTPException as exc:
+        raise RuntimeError(f"포럼 게시글 목록을 읽지 못했습니다: {exc}") from exc
+    return list(threads.values())
+
+async def _snapshot_forum_posts(forum, guild):
+    """고정 메시지가 있는 포럼 게시글과 그 안의 고정 메시지를 백업합니다."""
+    posts = []
+    for thread in await _get_forum_threads(forum):
         try:
-            await channel.send(result, delete_after=10)
+            pinned = await thread.pins()
+        except discord.HTTPException as exc:
+            raise RuntimeError(f"포럼 게시글 '{thread.name}'의 고정 메시지를 읽지 못했습니다: {exc}") from exc
+        flags = getattr(thread, "flags", None)
+        thread_is_pinned = bool(
+            getattr(thread, "pinned", False) or getattr(flags, "pinned", False)
+        )
+        if not pinned and not thread_is_pinned:
+            continue
+        try:
+            starter = await thread.fetch_message(thread.id)
+        except discord.HTTPException as exc:
+            raise RuntimeError(f"포럼 게시글 '{thread.name}'의 원본 게시글을 읽지 못했습니다: {exc}") from exc
+        starter_snapshot = await _snapshot_message(starter, guild)
+        pinned_ids = {message.id for message in pinned}
+        replies = []
+        for message in sorted(pinned, key=lambda m: m.created_at):
+            if message.id == starter.id:
+                continue
+            snap = await _snapshot_message(message, guild)
+            snap["was_pinned"] = True
+            replies.append(snap)
+        posts.append({
+            "name": thread.name,
+            "starter": starter_snapshot,
+            "starter_pinned": starter.id in pinned_ids,
+            "thread_pinned": thread_is_pinned,
+            "replies": replies,
+            "tag_names": [tag.name for tag in getattr(thread, "applied_tags", [])],
+            "auto_archive_duration": getattr(thread, "auto_archive_duration", 1440),
+            "locked": bool(getattr(thread, "locked", False)),
+        })
+    return posts
+
+async def _snapshot_channel(channel, guild):
+    kind = _channel_kind(channel)
+    if kind is None:
+        raise RuntimeError(
+            f"지원하지 않는 채널 유형({getattr(channel, 'type', '알 수 없음')}): "
+            f"'{getattr(channel, 'name', '알 수 없음')}'. 안전을 위해 아무 채널도 삭제하지 않았습니다."
+        )
+    snap = {
+        "old": channel,
+        "id": channel.id,
+        "name": channel.name,
+        "kind": kind,
+        "position": getattr(channel, "position", 0),
+        "category_id": getattr(getattr(channel, "category", None), "id", None),
+        "overwrites": dict(getattr(channel, "overwrites", {})),
+        "permissions_synced": bool(getattr(channel, "permissions_synced", False)),
+    }
+    if kind in ("text", "news"):
+        snap.update({
+            "topic": getattr(channel, "topic", None),
+            "slowmode_delay": getattr(channel, "slowmode_delay", 0),
+            "nsfw": getattr(channel, "nsfw", False),
+            "default_auto_archive_duration": getattr(channel, "default_auto_archive_duration", 1440),
+            "default_thread_slowmode_delay": getattr(channel, "default_thread_slowmode_delay", 0),
+        })
+        pins = await channel.pins()
+        snap["pins"] = [
+            await _snapshot_message(message, guild)
+            for message in sorted(pins, key=lambda m: m.created_at)
+        ]
+    elif kind == "forum":
+        snap.update({
+            "topic": getattr(channel, "topic", None),
+            "slowmode_delay": getattr(channel, "slowmode_delay", 0),
+            "nsfw": getattr(channel, "nsfw", False),
+            "default_auto_archive_duration": getattr(channel, "default_auto_archive_duration", 1440),
+            "default_thread_slowmode_delay": getattr(channel, "default_thread_slowmode_delay", 0),
+            "sort_order": getattr(channel, "sort_order", None),
+            "layout": getattr(channel, "layout", None),
+            "available_tags": list(getattr(channel, "available_tags", [])),
+            "forum_posts": await _snapshot_forum_posts(channel, guild),
+        })
+    elif kind in ("voice", "stage"):
+        snap.update({
+            "bitrate": getattr(channel, "bitrate", None),
+            "user_limit": getattr(channel, "user_limit", 0),
+            "rtc_region": getattr(channel, "rtc_region", None),
+            "video_quality_mode": getattr(channel, "video_quality_mode", None),
+        })
+    return snap
+
+def _clone_forum_tags(tags):
+    cloned = []
+    for tag in tags:
+        kwargs = {"name": tag.name, "moderated": getattr(tag, "moderated", False)}
+        emoji = getattr(tag, "emoji", None)
+        if emoji is not None:
+            kwargs["emoji"] = emoji
+        cloned.append(discord.ForumTag(**kwargs))
+    return cloned
+
+async def _create_channel_copy(guild, snap, category=None):
+    kind = snap["kind"]
+    name = snap["name"]
+    overwrites = snap["overwrites"]
+    reason = "낫또봇 채널 청소: 기존 채널 설정 복원"
+    if kind == "category":
+        new_channel = await guild.create_category(
+            name, overwrites=overwrites, reason=reason
+        )
+    elif kind in ("text", "news"):
+        new_channel = await guild.create_text_channel(
+            name,
+            category=category,
+            overwrites=overwrites,
+            topic=snap.get("topic"),
+            slowmode_delay=snap.get("slowmode_delay", 0),
+            nsfw=snap.get("nsfw", False),
+            default_auto_archive_duration=snap.get("default_auto_archive_duration", 1440),
+            default_thread_slowmode_delay=snap.get("default_thread_slowmode_delay", 0),
+            news=(kind == "news"),
+            reason=reason,
+        )
+    elif kind == "voice":
+        kwargs = {
+            "category": category,
+            "overwrites": overwrites,
+            "user_limit": snap.get("user_limit", 0),
+            "reason": reason,
+        }
+        if snap.get("bitrate") is not None:
+            kwargs["bitrate"] = snap["bitrate"]
+        if snap.get("rtc_region") is not None:
+            kwargs["rtc_region"] = snap["rtc_region"]
+        if snap.get("video_quality_mode") is not None:
+            kwargs["video_quality_mode"] = snap["video_quality_mode"]
+        new_channel = await guild.create_voice_channel(name, **kwargs)
+    elif kind == "stage":
+        kwargs = {
+            "category": category,
+            "overwrites": overwrites,
+            "user_limit": snap.get("user_limit", 0),
+            "reason": reason,
+        }
+        if snap.get("bitrate") is not None:
+            kwargs["bitrate"] = snap["bitrate"]
+        if snap.get("rtc_region") is not None:
+            kwargs["rtc_region"] = snap["rtc_region"]
+        if snap.get("video_quality_mode") is not None:
+            kwargs["video_quality_mode"] = snap["video_quality_mode"]
+        new_channel = await guild.create_stage_channel(name, **kwargs)
+    elif kind == "forum":
+        kwargs = {
+            "category": category,
+            "overwrites": overwrites,
+            "topic": snap.get("topic"),
+            "slowmode_delay": snap.get("slowmode_delay", 0),
+            "nsfw": snap.get("nsfw", False),
+            "default_auto_archive_duration": snap.get("default_auto_archive_duration", 1440),
+            "default_thread_slowmode_delay": snap.get("default_thread_slowmode_delay", 0),
+            "available_tags": _clone_forum_tags(snap.get("available_tags", [])),
+            "reason": reason,
+        }
+        if snap.get("sort_order") is not None:
+            kwargs["sort_order"] = snap["sort_order"]
+        if snap.get("layout") is not None:
+            kwargs["layout"] = snap["layout"]
+        new_channel = await guild.create_forum_channel(name, **kwargs)
+    else:
+        raise RuntimeError(f"지원하지 않는 채널 유형: {kind}")
+    if snap.get("permissions_synced") and category is not None:
+        await new_channel.edit(sync_permissions=True, reason=reason)
+    return new_channel
+
+async def _restore_forum_posts(new_forum, posts):
+    restored = 0
+    tags_by_name = {tag.name: tag for tag in getattr(new_forum, "available_tags", [])}
+    for post in posts:
+        starter = post["starter"]
+        files = [
+            discord.File(
+                io.BytesIO(item["data"]),
+                filename=item["filename"],
+                description=item["description"],
+                spoiler=item["spoiler"],
+            )
+            for item in starter.get("files", [])
+        ]
+        embeds = [discord.Embed.from_dict(item) for item in starter.get("embeds", [])[:10]]
+        kwargs = {
+            "name": post["name"],
+            "content": starter.get("content") or "‎",
+            "embeds": embeds,
+            "files": files,
+            "applied_tags": [
+                tags_by_name[name] for name in post.get("tag_names", []) if name in tags_by_name
+            ],
+            "auto_archive_duration": post.get("auto_archive_duration", 1440),
+            "allowed_mentions": discord.AllowedMentions.none(),
+            "reason": "낫또봇 채널 청소: 기존 포럼 게시글 복원",
+        }
+        created = await new_forum.create_thread(**kwargs)
+        new_thread = getattr(created, "thread", created)
+        starter_message = getattr(created, "message", None)
+        if starter_message is None:
+            starter_message = await new_thread.fetch_message(new_thread.id)
+        if post.get("starter_pinned"):
+            await starter_message.pin(reason="낫또봇 채널 청소: 고정 포스트 복원")
+        if post.get("thread_pinned"):
+            try:
+                await new_thread.edit(pinned=True, reason="낫또봇 채널 청소: 고정 포스트 복원")
+            except (discord.HTTPException, TypeError):
+                pass
+        for reply in post.get("replies", []):
+            await _send_message_snapshot(new_thread, reply, pin=True)
+        if post.get("locked"):
+            try:
+                await new_thread.edit(locked=True, archived=True, reason="낫또봇 채널 청소: 게시글 상태 복원")
+            except discord.HTTPException:
+                pass
+        restored += 1
+    return restored
+
+async def _restore_channel_pins(new_channel, snap):
+    restored = 0
+    if snap["kind"] in ("text", "news"):
+        for message_snapshot in snap.get("pins", []):
+            await _send_message_snapshot(new_channel, message_snapshot, pin=True)
+            restored += 1
+    elif snap["kind"] == "forum":
+        restored += await _restore_forum_posts(new_channel, snap.get("forum_posts", []))
+    return restored
+
+def _remap_saved_channel_ids(guild_id, channel_map):
+    """봇 자체 설정에 저장된 채널 ID를 새 채널 ID로 바꿉니다."""
+    gs = GUILD_SETTINGS.get(guild_id)
+    if not isinstance(gs, dict):
+        return
+    changed = False
+    for key, value in list(gs.items()):
+        if isinstance(value, int) and not isinstance(value, bool) and value in channel_map:
+            if "channel" in key.lower() or key in ("auth_channel", "punish_log_channel", "join_log_channel", "leave_log_channel"):
+                gs[key] = channel_map[value]
+                changed = True
+    if changed:
+        save_settings(GUILD_SETTINGS)
+
+async def _delete_created_channels(created):
+    for channel in reversed(created):
+        try:
+            await channel.delete(reason="낫또봇 청소 복구: 복제 실패로 생성한 채널 정리")
         except discord.HTTPException:
             pass
 
-async def collect_all_threads(guild: discord.Guild) -> dict:
-    """활성 + 보관된 스레드와 포럼 게시글을 모두 모읍니다."""
-    found = {}
-    for t in guild.threads:
-        found[t.id] = t
+async def _recreate_one_channel(interaction, channel):
+    guild = interaction.guild
+    if _channel_kind(channel) is None or _channel_kind(channel) == "category":
+        raise RuntimeError("텍스트/공지/음성/스테이지/포럼 채널에서만 /청소를 사용할 수 있습니다.")
+    if not guild.me.guild_permissions.manage_channels:
+        raise RuntimeError("봇에게 채널 관리 권한이 필요합니다.")
+    if not channel.permissions_for(guild.me).manage_channels:
+        raise RuntimeError("봇에게 이 채널의 채널 관리 권한이 없습니다.")
+
+    snap = await _snapshot_channel(channel, guild)
+    category = channel.category
+    new_channel = None
     try:
-        for t in await guild.active_threads():
-            found[t.id] = t
-    except discord.HTTPException:
-        pass
-    for ch in guild.channels:
-        if isinstance(ch, (discord.TextChannel, discord.ForumChannel)):
-            perms = ch.permissions_for(guild.me)
-            if not (perms.view_channel and perms.read_message_history):
-                continue
+        new_channel = await _create_channel_copy(guild, snap, category=category)
+        await _restore_channel_pins(new_channel, snap)
+        await channel.delete(reason=f"/청소 (집행자: {interaction.user})")
+        try:
+            await new_channel.edit(position=snap["position"], reason="낫또봇 채널 청소: 채널 순서 복원")
+        except discord.HTTPException:
+            pass
+        _remap_saved_channel_ids(guild.id, {channel.id: new_channel.id})
+        return new_channel
+    except Exception:
+        if new_channel is not None and channel.id in {c.id for c in guild.channels}:
             try:
-                async for t in ch.archived_threads(limit=None):
-                    found[t.id] = t
-                if isinstance(ch, discord.TextChannel) and perms.manage_threads:
-                    async for t in ch.archived_threads(limit=None, private=True):
-                        found[t.id] = t
+                await new_channel.delete(reason="낫또봇 청소 취소: 복원 실패")
             except discord.HTTPException:
-                continue
-    return found
+                pass
+        raise
 
 @app_commands.default_permissions(administrator=True)
+@app_commands.guild_only()
+@admin_only
+async def clean_channel_cb(interaction: discord.Interaction):
+    channel = interaction.channel
+    guild = interaction.guild
+    if guild.id in RUNNING_CLEANS:
+        await interaction.response.send_message("⏳ 이 서버에서 이미 채널 정리가 진행 중입니다.", ephemeral=True)
+        return
+    if not isinstance(channel, (discord.TextChannel, discord.VoiceChannel, discord.StageChannel)) and not (
+        hasattr(discord, "ForumChannel") and isinstance(channel, discord.ForumChannel)
+    ):
+        await interaction.response.send_message("❌ 일반 채널·공지 채널·음성·스테이지·포럼 채널에서만 사용할 수 있습니다.", ephemeral=True)
+        return
+    warn_text = (
+        f"🧹 **경고: 채널 재생성**\n"
+        f"{interaction.user.mention}님, {channel.mention} 채널을 새로 만들고 기존 채널을 삭제합니다.\n"
+        f"채널 권한·설정·위치와 고정 메시지/고정 포스트를 복사합니다. 일반 메시지는 복사되지 않습니다.\n"
+        f"채널 ID는 바뀌지만, 낫또봇의 저장된 채널 설정은 새 ID로 갱신합니다.\n\n"
+        f"✅ 진행 / ❌ 취소 (본인만 선택 가능, {CONFIRM_TIMEOUT}초 후 자동 취소)"
+    )
+    if not await confirm_by_reaction(interaction, warn_text, "채널 재생성"):
+        return
+
+    RUNNING_CLEANS.add(guild.id)
+    try:
+        new_channel = await _recreate_one_channel(interaction, channel)
+        await interaction.followup.send(
+            f"✅ 채널을 재생성했습니다: {new_channel.mention}\n"
+            f"채널 설정과 고정 메시지/포스트를 복원했습니다. 일반 메시지는 복원하지 않았습니다.",
+            ephemeral=True,
+        )
+    except Exception as exc:
+        await interaction.followup.send(
+            f"❌ 채널 재생성에 실패했습니다. 기존 채널이 남아 있는지 확인해 주세요.\n`{str(exc)[:1200]}`",
+            ephemeral=True,
+        )
+    finally:
+        RUNNING_CLEANS.discard(guild.id)
+
 @app_commands.guild_only()
 @admin_only
 async def clean_server_cb(interaction: discord.Interaction):
     guild = interaction.guild
     if guild.id in RUNNING_CLEANS:
-        await interaction.response.send_message("⏳ 이 서버에서 이미 청소가 진행 중입니다. 끝난 뒤 다시 시도해 주세요.", ephemeral=True)
+        await interaction.response.send_message("⏳ 이 서버에서 이미 채널 정리가 진행 중입니다.", ephemeral=True)
+        return
+    if not guild.me.guild_permissions.manage_channels:
+        await interaction.response.send_message("❌ 봇에게 서버 채널 관리 권한이 필요합니다.", ephemeral=True)
+        return
+
+    old_channels = list(guild.channels)
+    snapshots = []
+    # 지원하지 않는 채널이 하나라도 있으면, 일부만 지우는 일이 없도록 사전 검사에서 중단합니다.
+    try:
+        for channel in old_channels:
+            snapshots.append(await _snapshot_channel(channel, guild))
+    except Exception as exc:
+        await interaction.response.send_message(
+            f"❌ 서버 전체 재생성 전 검사에 실패했습니다. 아무 채널도 삭제하지 않았습니다.\n`{str(exc)[:1200]}`",
+            ephemeral=True,
+        )
         return
 
     warn_text = (
-        f"🧨 **경고: 서버 전체 청소**\n"
-        f"{interaction.user.mention}님, 이 서버의 **모든 채널 메세지, 스레드, 포럼 게시글(포스트)** 이 삭제되며 **절대 되돌릴 수 없습니다.**\n"
-        f"(채널과 역할은 삭제되지 않습니다. 양이 많으면 오랜 시간이 걸립니다.)\n\n"
-        f"✅ 를 누르면 **서버 청소 진행** / ❌ 를 누르면 **취소**\n"
-        f"(명령어를 입력한 본인만 선택할 수 있으며, {CONFIRM_TIMEOUT}초 안에 선택하지 않으면 자동 취소됩니다.)"
+        f"🧨 **경고: 서버 전체 채널 재생성**\n"
+        f"이 작업은 **{len(old_channels)}개 채널/카테고리**를 새로 만들고 기존 채널을 삭제합니다.\n"
+        f"채널 종류·권한·카테고리·순서·동기화 설정과 고정 메시지/포럼 고정 포스트를 복사합니다.\n"
+        f"일반 메시지, 기존 채널 ID, 채널 초대 링크 및 외부 봇/웹훅의 채널 참조는 보존되지 않을 수 있습니다.\n"
+        f"새 채널 생성과 고정 메시지 복사가 전부 성공한 뒤에만 원본 삭제를 시작합니다.\n\n"
+        f"✅ 진행 / ❌ 취소 (본인만 선택 가능, {CONFIRM_TIMEOUT}초 후 자동 취소)"
     )
-    if not await confirm_by_reaction(interaction, warn_text, "서버 청소"):
+    if not await confirm_by_reaction(interaction, warn_text, "서버 전체 채널 재생성"):
         return
 
     RUNNING_CLEANS.add(guild.id)
-    stats = {"messages": 0, "threads": 0, "skipped": 0, "failed": 0}
+    created = []
+    channel_map = {}
     try:
+        await interaction.followup.send(
+            "🧨 서버 채널 복제를 시작했습니다. 원본 채널은 복제가 끝날 때까지 삭제하지 않습니다.",
+            ephemeral=True,
+        )
+        # 카테고리를 먼저 복제합니다.
+        categories = [snap for snap in snapshots if snap["kind"] == "category"]
+        others = [snap for snap in snapshots if snap["kind"] != "category"]
+        for snap in categories:
+            new_category = await _create_channel_copy(guild, snap)
+            created.append(new_category)
+            channel_map[snap["id"]] = new_category
+        # 나머지 채널은 새 카테고리 안에 생성합니다.
+        for snap in others:
+            new_category = channel_map.get(snap["category_id"])
+            new_channel = await _create_channel_copy(guild, snap, category=new_category)
+            created.append(new_channel)
+            channel_map[snap["id"]] = new_channel
+
+        # 고정 메시지와 포럼 고정 게시글을 모두 복원합니다. 실패하면 원본은 그대로 둡니다.
+        for snap in others:
+            new_channel = channel_map[snap["id"]]
+            await _restore_channel_pins(new_channel, snap)
+
+        # 새 채널 복제와 고정 콘텐츠 복원이 끝난 후에만 원본을 삭제합니다.
+        delete_order = sorted(snapshots, key=lambda item: item["kind"] == "category")
+        delete_errors = []
+        for snap in delete_order:
+            try:
+                await snap["old"].delete(reason=f"/서버청소 (집행자: {interaction.user})")
+            except discord.HTTPException as exc:
+                delete_errors.append(f"{snap['name']}: {exc}")
+
+        # 원래의 채널/카테고리 배열을 복원합니다.
         try:
-            await interaction.followup.send("🧨 서버 청소를 시작했습니다. 끝나면 결과를 알려드릴게요. (시간이 걸릴 수 있어요)", ephemeral=True)
-        except discord.HTTPException:
+            positions = {
+                channel_map[snap["id"]]: snap["position"]
+                for snap in snapshots
+                if snap["id"] in channel_map
+            }
+            await guild.edit_channel_positions(positions=positions, reason="낫또봇 서버 청소: 채널 순서 복원")
+        except (discord.HTTPException, AttributeError):
             pass
 
-        # 1) 스레드 · 포럼 게시글 삭제 (스레드 안의 메세지도 함께 사라집니다)
-        threads = await collect_all_threads(guild)
-        for t in threads.values():
-            parent = t.parent
-            if parent is None or not parent.permissions_for(guild.me).manage_threads:
-                stats["skipped"] += 1
-                continue
-            try:
-                await t.delete(reason=f"/서버청소 (집행자: {interaction.user.name})")
-                stats["threads"] += 1
-            except discord.HTTPException:
-                stats["failed"] += 1
-
-        # 2) 채널 메세지 삭제
-        for ch in guild.channels:
-            if not isinstance(ch, (discord.TextChannel, discord.VoiceChannel, discord.StageChannel)):
-                continue
-            p = ch.permissions_for(guild.me)
-            if not (p.view_channel and p.manage_messages and p.read_message_history):
-                stats["skipped"] += 1
-                continue
-            try:
-                deleted = await ch.purge(limit=None, bulk=True, reason=f"/서버청소 (집행자: {interaction.user.name})")
-                stats["messages"] += len(deleted)
-            except discord.HTTPException:
-                stats["failed"] += 1
+        id_map = {old_id: new_channel.id for old_id, new_channel in channel_map.items()}
+        _remap_saved_channel_ids(guild.id, id_map)
+        if delete_errors:
+            sample = "\n".join(delete_errors[:8])
+            await interaction.followup.send(
+                f"⚠️ 새 채널과 고정 콘텐츠는 복원했지만, 일부 원본 채널을 삭제하지 못했습니다.\n"
+                f"봇 권한을 확인해 주세요:\n```{sample}```",
+                ephemeral=True,
+            )
+        else:
+            await interaction.followup.send(
+                f"✅ 서버 채널 재생성 완료!\n"
+                f"카테고리/채널 {len(snapshots)}개를 복제하고 채널 순서와 봇 내부 채널 설정 ID를 갱신했습니다.\n"
+                f"일반 메시지는 복사하지 않았고, 고정 메시지와 고정 포럼 포스트만 복원했습니다.",
+                ephemeral=True,
+            )
+    except Exception as exc:
+        # 복제나 고정 메시지 복원이 실패하면 원본은 아직 삭제하지 않았으므로 새로 만든 채널만 정리합니다.
+        await _delete_created_channels(created)
+        await interaction.followup.send(
+            f"❌ 서버 재생성 도중 오류가 발생했습니다. 원본 채널은 삭제 전 단계에서 중단했습니다.\n"
+            f"`{str(exc)[:1200]}`",
+            ephemeral=True,
+        )
     finally:
         RUNNING_CLEANS.discard(guild.id)
-
-    embed = discord.Embed(title="🧨 서버 청소 완료", color=discord.Color.dark_red(), timestamp=discord.utils.utcnow())
-    embed.add_field(name="💬 삭제한 메세지", value=f"{stats['messages']}개", inline=True)
-    embed.add_field(name="🧵 삭제한 스레드·포스트", value=f"{stats['threads']}개", inline=True)
-    embed.add_field(name="⏭️ 권한 부족으로 건너뜀", value=f"{stats['skipped']}곳", inline=True)
-    if stats["failed"]:
-        embed.add_field(name="⚠️ 오류로 실패", value=f"{stats['failed']}곳", inline=True)
-    embed.set_footer(text="건너뛴 곳은 봇에 '채널 보기·메시지 관리·메시지 기록 보기·스레드 관리' 권한을 주면 청소됩니다.")
-    try:
-        await interaction.followup.send(embed=embed, ephemeral=True)
-    except discord.HTTPException:
-        try:
-            await interaction.user.send(embed=embed)
-        except discord.HTTPException:
-            pass
 
 # ---------- 가이드 ----------
 CATEGORY_WARN = {
@@ -1186,6 +1564,59 @@ async def guide_cb(interaction: discord.Interaction):
     view = GuideView(interaction.guild.id)
     await interaction.response.send_message(embed=build_guide_embed(interaction.guild.id, "home"), view=view, ephemeral=True)
     view.interaction = interaction
+
+
+# ---------- /번역 (모든 사용자 사용 가능, 활성화 후 표시) ----------
+@app_commands.choices(언어=[
+    app_commands.Choice(name="English", value="en"),
+    app_commands.Choice(name="日本語", value="ja"),
+    app_commands.Choice(name="한국어", value="ko"),
+])
+@app_commands.describe(언어="번역 결과 언어를 선택하세요.", 내용="번역할 문장을 입력하세요.")
+@app_commands.guild_only()
+async def translate_cb(interaction: discord.Interaction, 언어: app_commands.Choice[str], 내용: str):
+    text_to_translate = 내용.strip()
+    if not text_to_translate:
+        await interaction.response.send_message("번역할 문장을 입력해 주세요.", ephemeral=True)
+        return
+    if len(text_to_translate) > 1500:
+        await interaction.response.send_message("한 번에 최대 1,500자까지 번역할 수 있습니다.", ephemeral=True)
+        return
+
+    language_names = {"en": "English", "ja": "日本語", "ko": "한국어"}
+    await interaction.response.defer(thinking=True)
+    try:
+        timeout = aiohttp.ClientTimeout(total=20)
+        url = "https://translate.googleapis.com/translate_a/single"
+        params = {
+            "client": "gtx",
+            "sl": "auto",
+            "tl": 언어.value,
+            "dt": "t",
+            "q": text_to_translate,
+        }
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url, params=params) as response:
+                response.raise_for_status()
+                data = await response.json(content_type=None)
+        translated = "".join(
+            part[0] for part in (data[0] or [])
+            if isinstance(part, list) and part and isinstance(part[0], str)
+        ).strip()
+        if not translated:
+            raise ValueError("번역 결과가 비어 있습니다.")
+        embed = discord.Embed(
+            title=f"🌐 번역 결과 · {language_names[언어.value]}",
+            color=discord.Color.blurple(),
+        )
+        embed.add_field(name="원문", value=text_to_translate[:1024], inline=False)
+        embed.description = translated[:4000]
+        await interaction.followup.send(embed=embed)
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, IndexError, TypeError) as exc:
+        await interaction.followup.send(
+            f"❌ 번역에 실패했습니다. 잠시 후 다시 시도해 주세요. (`{type(exc).__name__}`)",
+            ephemeral=True,
+        )
 
 # ====================================================================
 # 📚 기능 카탈로그 (카테고리 · 명령어 매핑)
@@ -1282,14 +1713,18 @@ FEATURES = {
     },
     # ---------- 청소 ----------
     "청소": {
-        "cat": "청소", "desc": "명령어를 쓴 채널의 모든 메세지를 삭제합니다. (✅/❌ 확인)", "usage": "",
+        "cat": "청소", "desc": "현재 채널을 같은 설정으로 재생성하고 고정 메시지/포스트를 복원합니다. (관리자, 확인 필요)", "usage": "",
         "top": clean_channel_cb,
     },
     "서버청소": {
-        "cat": "청소", "desc": "서버의 모든 메세지·스레드·포스트를 삭제합니다. (관리자, ✅/❌ 확인)", "usage": "",
+        "cat": "청소", "desc": "서버 채널/카테고리를 같은 설정과 순서로 재생성하고 고정 메시지/포럼 포스트를 복원합니다. (관리자, 확인 필요)", "usage": "",
         "top": clean_server_cb,
     },
     # ---------- 기타 ----------
+    "번역": {
+        "cat": "기타", "desc": "입력한 문장을 영어·일본어·한국어로 번역합니다. (모든 사용자 사용 가능)", "usage": "`언어` `내용`",
+        "top": translate_cb,
+    },
     "가이드": {
         "cat": "기타", "desc": "낫또봇 사용법을 카테고리별로 보여줍니다.", "usage": "",
         "top": guide_cb,
@@ -1570,17 +2005,36 @@ def build_guild_commands(guild_id: int) -> list:
     enabled = enabled_keys(guild_id)
     if not enabled:
         return []
+    admin_permissions = discord.Permissions(administrator=True)
     result = [
-        app_commands.Command(name="설정", description="기능을 선택해 값을 설정합니다.", callback=generic_set_cb),
-        app_commands.Command(name="체크", description="기능의 현재 설정을 확인합니다.", callback=generic_check_cb),
-        app_commands.Command(name="제거", description="기능의 설정 또는 목록 항목을 제거합니다.", callback=generic_remove_cb),
-        app_commands.Command(name="초기화", description="기능의 목록을 초기화합니다.", callback=generic_reset_cb),
-        app_commands.Command(name="비활성화", description="켜 둔 기능을 끕니다.", callback=deactivate_cb),
-        app_commands.Command(name="역할주기", description="선택한 멤버에게 역할을 지급합니다.", callback=give_role_cb),
+        app_commands.Command(name="설정", description="기능을 선택해 값을 설정합니다.", callback=generic_set_cb, default_permissions=admin_permissions),
+        app_commands.Command(name="체크", description="기능의 현재 설정을 확인합니다.", callback=generic_check_cb, default_permissions=admin_permissions),
+        app_commands.Command(name="제거", description="기능의 설정 또는 목록 항목을 제거합니다.", callback=generic_remove_cb, default_permissions=admin_permissions),
+        app_commands.Command(name="초기화", description="기능의 목록을 초기화합니다.", callback=generic_reset_cb, default_permissions=admin_permissions),
+        app_commands.Command(name="비활성화", description="켜 둔 기능을 끕니다.", callback=deactivate_cb, default_permissions=admin_permissions),
+        app_commands.Command(name="역할주기", description="선택한 멤버에게 역할을 지급합니다.", callback=give_role_cb, default_permissions=discord.Permissions(manage_roles=True)),
     ]
+    command_permissions = {
+        "인증완료": discord.Permissions(manage_roles=True),
+        "제재": discord.Permissions(moderate_members=True),
+        "제재지우기": discord.Permissions(moderate_members=True),
+        "추방": discord.Permissions(ban_members=True),
+        "추방해제": discord.Permissions(ban_members=True),
+        "청소": admin_permissions,
+        "서버청소": admin_permissions,
+    }
+    public_commands = {"번역", "가이드"}
     for k, f in FEATURES.items():
         if k in enabled and "top" in f:
-            result.append(app_commands.Command(name=k, description=f["desc"][:100], callback=f["top"]))
+            kwargs = {}
+            if k in command_permissions:
+                kwargs["default_permissions"] = command_permissions[k]
+            elif k not in public_commands:
+                # 기능 관리/운영 명령어는 관리자 권한이 없는 계정의 목록에 노출하지 않습니다.
+                kwargs["default_permissions"] = admin_permissions
+            result.append(app_commands.Command(
+                name=k, description=f["desc"][:100], callback=f["top"], **kwargs
+            ))
     return result
 
 def register_guild_commands(guild_id: int) -> discord.Object:
@@ -1669,7 +2123,7 @@ async def deactivate_cb(interaction: discord.Interaction, 기능: str):
     await interaction.followup.send(f"⛔ **{기능}** 기능을 비활성화했습니다. 저장된 설정값은 남아 있으니 `/활성화`에서 『{FEATURES[기능]['cat']}』 {기능} 선택 로 다시 켜면 그대로 쓸 수 있어요.")
 
 def build_activation_group() -> app_commands.Command:
-    return app_commands.Command(name="활성화", description="사용할 기능을 검색해 하나씩 활성화합니다.", callback=generic_activate_cb)
+    return app_commands.Command(name="활성화", description="사용할 기능을 검색해 하나씩 활성화합니다.", callback=generic_activate_cb, default_permissions=discord.Permissions(administrator=True))
 
 @app_commands.guild_only()
 @admin_only
@@ -1677,7 +2131,7 @@ async def activate_all_cb(interaction: discord.Interaction):
     await activate_features(interaction, list(FEATURES.keys()))
 
 def build_activate_all_command() -> app_commands.Command:
-    return app_commands.Command(name="모두활성화", description="모든 기능을 한 번에 활성화합니다.", callback=activate_all_cb)
+    return app_commands.Command(name="모두활성화", description="모든 기능을 한 번에 활성화합니다.", callback=activate_all_cb, default_permissions=discord.Permissions(administrator=True))
 
 @app_commands.guild_only()
 @admin_only
@@ -1704,7 +2158,7 @@ async def deactivate_all_cb(interaction: discord.Interaction):
     await interaction.followup.send(f"⛔ 전체 기능 {len(old)}개를 비활성화했습니다. 저장된 설정값은 유지됩니다.")
 
 def build_deactivate_all_command() -> app_commands.Command:
-    return app_commands.Command(name="모두비활성화", description="모든 기능을 한 번에 비활성화합니다.", callback=deactivate_all_cb)
+    return app_commands.Command(name="모두비활성화", description="모든 기능을 한 번에 비활성화합니다.", callback=deactivate_all_cb, default_permissions=discord.Permissions(administrator=True))
 
 # ================= [ 실행 ] =================
 if __name__ == "__main__":
