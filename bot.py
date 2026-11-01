@@ -1411,7 +1411,7 @@ CATEGORY_WARN = {
     "제재": "`제재로그`가 비어 있으면 **`/제재`·`/제재지우기`를 쓸 수 없고**, 자동 제재는 처리돼도 로그가 남지 않습니다. `/추방`은 영구 차단이라 `/추방해제`로만 풀 수 있어요.",
     "입퇴장": "로그 채널을 정하지 않으면 해당 입장/퇴장 기록이 남지 않습니다.",
     "청소": "채널은 **새로 만들어지고 기존 채널은 삭제**되므로 되돌릴 수 없습니다. 고정 메시지와 고정 포럼 게시글만 복원되고, 일반 메시지와 스레드는 복원되지 않아요. 실행 전 ✅/❌ 확인창이 한 번 더 나옵니다.",
-    "문의": "봇에 **채널 관리** 권한이 있어야 문의방을 만들 수 있어요. 문의방은 문의한 사람과 서버 관리자만 볼 수 있고, `@everyone` 알림도 그 방을 볼 수 있는 관리자에게만 갑니다. 기능을 끄면 버튼을 눌러도 비활성화 안내만 나와요. 안내글을 다시 쓰려면 `/제거 문의함` 후 `/설정 문의함`을 실행하세요.",
+    "문의": "봇에 **채널 관리** 권한이 있어야 문의방을 만들 수 있어요. 문의방(`문의함-번호`)은 안내글 채널 바로 아래에 생기고, 문의한 사람·서버 관리자·지정한 열람 역할만 볼 수 있습니다. `@everyone` 알림도 그 방을 볼 수 있는 사람에게만 가요. **문의 닫기**는 문의를 연 일반 유저를 뺀 모두가 쓸 수 있습니다. 기능을 끄면 버튼을 눌러도 비활성화 안내만 나오고, 안내글을 다시 쓰려면 `/제거 문의함` 후 `/설정 문의함`을 실행하세요.",
     "기타": "",
 }
 
@@ -1656,24 +1656,43 @@ async def translate_cb(interaction: discord.Interaction, 언어: app_commands.Ch
         )
 
 # ====================================================================
-# 📨 문의함 (버튼으로 문의한 사람 + 관리자만 보는 비공개 문의방 열기)
+# 📨 문의함 (버튼으로 문의자 + 관리자 + 지정 역할만 보는 비공개 문의방 열기)
 # ====================================================================
 INQUIRY_FEATURE = "문의함"
+INQUIRY_PANEL_TITLE = "📨 문의함"   # 안내글 제목은 고정이며 설정에서 바꿀 수 없습니다.
 INQUIRY_DISABLED_TEXT = "⛔ 지금 이 기능은 관리자에 의해 비활성화 된 상황입니다."
 INQUIRY_WAIT_TEXT = "관리자가 오실때까지 시간의 여유를 즐기세요...☕☕"
+INQUIRY_CLOSE_DELAY = 5
+_INQUIRY_LOCKS = {}
+_CLOSING_INQUIRIES = set()
+
+def _inquiry_lock(guild_id: int) -> asyncio.Lock:
+    return _INQUIRY_LOCKS.setdefault(guild_id, asyncio.Lock())
 
 def _inquiry_owner_id(channel) -> int:
     """문의방 주제(topic)에 적어 둔 문의자 ID를 읽습니다. 문의방이 아니면 0."""
     match = re.search(r"inquiry:(\d+)", getattr(channel, "topic", None) or "")
     return int(match.group(1)) if match else 0
 
-def _inquiry_channel_name(member: discord.Member) -> str:
-    base = re.sub(r"[^0-9a-zA-Z가-힣_-]", "", member.name)[:40] or str(member.id)
-    return f"문의-{base}".lower()
+def _grantable(perms: discord.Permissions, *names: str) -> discord.PermissionOverwrite:
+    """봇이 실제로 가진 권한만 골라 허용합니다. (없는 권한을 부여하려 하면 디스코드가 거부함)"""
+    return discord.PermissionOverwrite(**{n: True for n in names if getattr(perms, n, False)})
 
-def _grantable(perms: discord.Permissions, *names: str) -> dict:
-    """봇이 실제로 가진 권한만 골라 허용 목록으로 만듭니다. (없는 권한을 부여하려 하면 디스코드가 거부함)"""
-    return {n: True for n in names if getattr(perms, n, False)}
+_VIEWER_PERMS = ("view_channel", "send_messages", "read_message_history", "attach_files", "embed_links")
+
+def _can_close_inquiry(interaction: discord.Interaction, channel, owner_id: int) -> bool:
+    """문의를 연 일반 유저만 닫을 수 없습니다. 관리자·열람 역할·그 외 이 방을 볼 수 있는 사람은 닫을 수 있습니다."""
+    user = interaction.user
+    if interaction.permissions.administrator:
+        return True
+    if user.id != owner_id:
+        return True
+    # 문의자 본인이라도 열람 역할(담당자)을 가지고 있으면 닫을 수 있습니다.
+    return any(
+        channel.overwrites_for(role).view_channel
+        for role in getattr(user, "roles", [])
+        if not role.is_default()
+    )
 
 async def _delete_inquiry_panel(guild: discord.Guild, gs: dict):
     """저장된 문의함 안내글을 지웁니다. 이미 없거나 지울 수 없으면 조용히 넘어갑니다."""
@@ -1696,63 +1715,78 @@ async def open_inquiry_channel(interaction: discord.Interaction):
         return
 
     member = interaction.user
-    for existing in guild.text_channels:
-        if _inquiry_owner_id(existing) == member.id:
-            await interaction.response.send_message(
-                f"📨 이미 열려 있는 문의방이 있어요: {existing.mention}", ephemeral=True
-            )
-            return
-
     await interaction.response.defer(ephemeral=True)
-    gs = GUILD_SETTINGS.get(guild.id, {})
-    panel_channel = guild.get_channel(gs.get("inquiry_channel", 0))
-    category = panel_channel.category if panel_channel else None
-
     me = guild.me
-    overwrites = {
-        # 모두에게 숨기고, 문의한 사람과 봇만 보이게 합니다.
+
+    # 번호 계산과 채널 생성을 한 번에 묶어, 동시에 눌러도 번호가 겹치거나 방이 두 개 생기지 않게 합니다.
+    async with _inquiry_lock(guild.id):
+        gs = get_gs(guild.id)
+        for existing in guild.text_channels:
+            if _inquiry_owner_id(existing) == member.id:
+                await interaction.followup.send(f"📨 이미 열려 있는 문의방이 있어요: {existing.mention}", ephemeral=True)
+                return
+
+        panel_channel = guild.get_channel(gs.get("inquiry_channel", 0))
+        category = panel_channel.category if panel_channel else None
+        number = int(gs.get("inquiry_count", 0)) + 1
+
+        # 모두에게 숨기고, 문의한 사람 + 봇 + 지정한 열람 역할만 보이게 합니다.
         # 서버 관리자 권한을 가진 사람은 디스코드 규칙상 모든 채널을 자동으로 볼 수 있습니다.
-        guild.default_role: discord.PermissionOverwrite(view_channel=False),
-        member: discord.PermissionOverwrite(
-            **_grantable(me.guild_permissions, "view_channel", "send_messages", "read_message_history", "attach_files", "embed_links")
-        ),
-        me: discord.PermissionOverwrite(
-            **_grantable(me.guild_permissions, "view_channel", "send_messages", "read_message_history", "embed_links", "manage_channels", "mention_everyone")
-        ),
-    }
-    try:
-        channel = await guild.create_text_channel(
-            name=_inquiry_channel_name(member),
-            category=category,
-            overwrites=overwrites,
-            topic=f"{safe_text(member.display_name)}님의 문의방 | inquiry:{member.id}",
-            reason=f"문의함: {member} 님이 문의방을 열었습니다.",
-        )
-    except discord.Forbidden:
-        await interaction.followup.send("❌ 봇에게 채널 관리 권한이 없어 문의방을 만들 수 없습니다. 관리자에게 알려주세요.", ephemeral=True)
-        return
-    except discord.HTTPException as exc:
-        await interaction.followup.send(f"❌ 문의방을 만들지 못했습니다. 잠시 후 다시 시도해 주세요. (`{exc.status}`)", ephemeral=True)
-        return
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            member: _grantable(me.guild_permissions, *_VIEWER_PERMS),
+            me: _grantable(me.guild_permissions, "view_channel", "send_messages", "read_message_history",
+                           "embed_links", "manage_channels", "mention_everyone"),
+        }
+        for role_id in gs.get("inquiry_roles", []):
+            role = guild.get_role(role_id)
+            if role and not role.is_default():
+                overwrites[role] = _grantable(me.guild_permissions, *_VIEWER_PERMS)
+
+        try:
+            channel = await guild.create_text_channel(
+                name=f"문의함-{number}",
+                category=category,
+                overwrites=overwrites,
+                topic=f"{safe_text(member.display_name)}님의 문의방 | inquiry:{member.id}",
+                reason=f"문의함: {member} 님이 문의방을 열었습니다.",
+            )
+        except discord.Forbidden:
+            await interaction.followup.send("❌ 봇에게 채널 관리 권한이 없어 문의방을 만들 수 없습니다. 관리자에게 알려주세요.", ephemeral=True)
+            return
+        except discord.HTTPException as exc:
+            await interaction.followup.send(f"❌ 문의방을 만들지 못했습니다. 잠시 후 다시 시도해 주세요. (`{exc.status}`)", ephemeral=True)
+            return
+        gs["inquiry_count"] = number
+        save_settings(GUILD_SETTINGS)
+
+    # 문의함으로 지정한 채널 바로 아래로 옮깁니다. (실패해도 방은 정상 사용 가능)
+    if panel_channel:
+        try:
+            await channel.move(after=panel_channel, reason="문의함 안내글 채널 바로 아래로 배치")
+        except (discord.HTTPException, ValueError, TypeError) as exc:
+            print(f"문의방 위치 이동 실패: {exc}")
 
     embed = discord.Embed(
         title="📨 문의가 시작되었습니다",
         description=(
-            f"{member.mention}님, 궁금한 점이나 도움이 필요한 내용을 이 방에 편하게 남겨주세요.\n\n"
+            f"{member.mention}님,\n"
+            f"궁금한 점이나 도움이 필요한 내용을\n"
+            f"이 방에 편하게 남겨주세요.\n\n"
             f"{INQUIRY_WAIT_TEXT}"
         ),
         color=discord.Color.orange(),
         timestamp=discord.utils.utcnow(),
     )
-    embed.set_footer(text="이 방은 문의하신 분과 서버 관리자만 볼 수 있어요.")
+    embed.set_footer(text="이 방은 문의하신 분과 담당 관리자만 볼 수 있어요.")
     try:
         # 멘션은 임베드 안이 아니라 메시지 본문에 있어야 알림이 갑니다.
-        # 비공개 방이라 @everyone 알림은 이 방을 볼 수 있는 관리자에게만 갑니다.
+        # 비공개 방이라 @everyone 알림은 이 방을 볼 수 있는 사람에게만 갑니다.
         await channel.send(
-            content=f"@everyone {member.mention}",
+            content="@everyone",
             embed=embed,
             view=InquiryCloseView(),
-            allowed_mentions=discord.AllowedMentions(everyone=True, users=[member], roles=False),
+            allowed_mentions=discord.AllowedMentions(everyone=True, users=False, roles=False),
         )
     except discord.HTTPException as exc:
         try:
@@ -1773,7 +1807,7 @@ class InquiryOpenView(discord.ui.View):
         await open_inquiry_channel(interaction)
 
 class InquiryCloseView(discord.ui.View):
-    """문의방 안의 '문의 닫기' 버튼 (문의한 사람 또는 관리자만 사용 가능)"""
+    """문의방 안의 '문의 닫기' 버튼 (문의를 연 일반 유저를 제외한 모두가 사용 가능)"""
     def __init__(self):
         super().__init__(timeout=None)
 
@@ -1784,32 +1818,35 @@ class InquiryCloseView(discord.ui.View):
         if not owner_id:
             await interaction.response.send_message("❌ 문의방에서만 사용할 수 있습니다.", ephemeral=True)
             return
-        if interaction.user.id != owner_id and not interaction.permissions.administrator:
-            await interaction.response.send_message("❌ 문의한 사람 또는 관리자만 닫을 수 있습니다.", ephemeral=True)
+        if not _can_close_inquiry(interaction, channel, owner_id):
+            await interaction.response.send_message("❌ 문의 닫기는 관리자 또는 담당 역할을 가진 분만 할 수 있습니다.", ephemeral=True)
             return
-        await interaction.response.send_message("🔒 5초 뒤 이 문의방을 닫습니다.")
-        await asyncio.sleep(5)
+        if channel.id in _CLOSING_INQUIRIES:
+            await interaction.response.send_message("⏳ 이미 문의를 닫는 중입니다.", ephemeral=True)
+            return
+        _CLOSING_INQUIRIES.add(channel.id)
         try:
+            await interaction.response.send_message(f"🔒 낫또봇이 {INQUIRY_CLOSE_DELAY}초뒤 문의를 중단합니다....")
+            await asyncio.sleep(INQUIRY_CLOSE_DELAY)
             await channel.delete(reason=f"문의 종료 (닫은 사람: {interaction.user})")
         except discord.HTTPException:
             try:
                 await interaction.followup.send("❌ 문의방을 닫지 못했습니다. 봇의 채널 관리 권한을 확인해 주세요.", ephemeral=True)
             except discord.HTTPException:
                 pass
+        finally:
+            _CLOSING_INQUIRIES.discard(channel.id)
 
 class InquiryPanelModal(discord.ui.Modal):
-    """문의함 안내글(임베드)에 들어갈 제목과 내용을 입력받습니다."""
-    def __init__(self, channel_id: int):
+    """문의함 안내글(임베드)에 들어갈 내용을 입력받습니다. 제목은 고정이라 입력받지 않습니다."""
+    def __init__(self, channel_id: int, role_ids: list):
         super().__init__(title="문의함 안내글 작성", timeout=900)
         self.channel_id = channel_id
-        self.title_input = discord.ui.TextInput(
-            label="제목", default="📨 문의함", required=True, max_length=100
-        )
+        self.role_ids = role_ids
         self.body_input = discord.ui.TextInput(
             label="안내 내용", style=discord.TextStyle.paragraph, required=True, max_length=3000,
             placeholder="문의 전에 알아야 할 내용을 적어주세요. 줄바꿈은 그대로 입력하면 됩니다.",
         )
-        self.add_item(self.title_input)
         self.add_item(self.body_input)
 
     async def on_submit(self, interaction: discord.Interaction):
@@ -1819,7 +1856,7 @@ class InquiryPanelModal(discord.ui.Modal):
             await interaction.response.send_message("❌ 선택한 채널을 찾을 수 없습니다. 다시 `/설정 문의함`을 실행해 주세요.", ephemeral=True)
             return
         embed = discord.Embed(
-            title=self.title_input.value.strip() or "📨 문의함",
+            title=INQUIRY_PANEL_TITLE,
             description=self.body_input.value.strip(),
             color=discord.Color.blurple(),
         )
@@ -1837,20 +1874,50 @@ class InquiryPanelModal(discord.ui.Modal):
         await _delete_inquiry_panel(guild, gs)  # 이전 안내글이 있으면 정리
         gs["inquiry_channel"] = channel.id
         gs["inquiry_panel_message"] = message.id
+        gs["inquiry_roles"] = list(self.role_ids)
         save_settings(GUILD_SETTINGS)
+        roles_text = " ".join(f"<@&{rid}>" for rid in self.role_ids)
         done = discord.Embed(
             title="✅ 문의함 설정 완료",
-            description=f"{channel.mention} 에 안내글과 **문의함 열기** 버튼을 올렸습니다.\n[안내글 바로가기]({message.jump_url})",
+            description=(
+                f"{channel.mention} 에 안내글과 **문의함 열기** 버튼을 올렸습니다.\n"
+                f"[안내글 바로가기]({message.jump_url})"
+            ),
             color=discord.Color.green(),
         )
+        done.add_field(name="문의방을 볼 수 있는 역할", value=f"{roles_text}\n(서버 관리자는 항상 볼 수 있어요)", inline=False)
         await interaction.followup.send(embed=done, ephemeral=True)
 
+class InquiryRoleSelect(discord.ui.RoleSelect):
+    """2단계: 문의방을 볼 수 있는 역할 선택"""
+    def __init__(self, channel_id: int):
+        super().__init__(placeholder="문의방을 볼 수 있는 역할을 선택하세요 (최대 5개)", min_values=1, max_values=5)
+        self.channel_id = channel_id
+
+    async def callback(self, interaction: discord.Interaction):
+        roles = [r for r in self.values if not r.is_default()]
+        if not roles:
+            await interaction.response.send_message("❌ @everyone 은 선택할 수 없습니다. 담당 역할을 골라 주세요.", ephemeral=True)
+            return
+        await interaction.response.send_modal(InquiryPanelModal(self.channel_id, [r.id for r in roles]))
+
 class InquiryChannelSelect(discord.ui.ChannelSelect):
+    """1단계: 안내글을 올릴 채널 선택"""
     def __init__(self):
         super().__init__(placeholder="문의함 안내글을 올릴 채널을 선택하세요", channel_types=[discord.ChannelType.text], min_values=1, max_values=1)
 
     async def callback(self, interaction: discord.Interaction):
-        await interaction.response.send_modal(InquiryPanelModal(self.values[0].id))
+        channel = self.values[0]
+        view = discord.ui.View(timeout=180)
+        view.add_item(InquiryRoleSelect(channel.id))
+        await interaction.response.edit_message(
+            content=(
+                f"**문의함** 설정 (2/2): 문의방을 **볼 수 있는 역할**을 선택하세요.\n"
+                f"안내글 채널: <#{channel.id}>\n"
+                f"서버 관리자는 따로 고르지 않아도 항상 볼 수 있어요."
+            ),
+            view=view,
+        )
 
 # ====================================================================
 # 📚 기능 카탈로그 (카테고리 · 명령어 매핑)
@@ -1958,8 +2025,8 @@ FEATURES = {
     # ---------- 문의 ----------
     "문의함": {
         "cat": "문의", "label": "문의함 채널", "store": "inquiry_channel",
-        "desc": "문의함 열기 버튼이 달린 안내글을 올립니다. 누르면 문의한 사람과 관리자만 보는 비공개 문의방이 열려요.",
-        "usage": "`채널`",
+        "desc": "문의함 열기 버튼이 달린 안내글을 올립니다. 누르면 문의자·관리자·지정 역할만 보는 비공개 문의방이 열려요.",
+        "usage": "`채널` → `열람 역할` → `안내 내용`",
         "set": make_set_channel("inquiry_channel", "문의함 채널"),
         "remove": make_remove_channel("inquiry_channel", "문의함 채널"),
         "check": make_check_channel("inquiry_channel", "문의함 채널"),
@@ -2163,7 +2230,7 @@ async def generic_set_cb(interaction: discord.Interaction, 기능: str):
     elif 기능 == "문의함":
         view = discord.ui.View(timeout=180)
         view.add_item(InquiryChannelSelect())
-        await interaction.response.send_message("**문의함** 설정: 안내글과 **문의함 열기** 버튼을 올릴 채널을 선택하세요.", view=view, ephemeral=True)
+        await interaction.response.send_message("**문의함** 설정 (1/2): 안내글과 **문의함 열기** 버튼을 올릴 채널을 선택하세요.", view=view, ephemeral=True)
     elif 기능 == "인증지급":
         view = discord.ui.View(timeout=180)
         view.add_item(SettingRoleSelect(기능))
@@ -2200,11 +2267,18 @@ async def generic_check_cb(interaction: discord.Interaction, 기능: str):
         channel = guild.get_channel(channel_id) if channel_id else None
         if channel:
             embed = _check_embed(기능, channel.mention, True)  # #채널명 링크로 표시됩니다.
-            message_id = gs.get("inquiry_panel_message") if 기능 == "문의함" else None
-            if message_id:
+            if 기능 == "문의함":
+                message_id = gs.get("inquiry_panel_message")
+                if message_id:
+                    embed.add_field(
+                        name="안내글",
+                        value=f"[바로가기](https://discord.com/channels/{guild.id}/{channel.id}/{message_id})",
+                        inline=False,
+                    )
+                viewers = [r for r in (guild.get_role(x) for x in gs.get("inquiry_roles", [])) if r]
                 embed.add_field(
-                    name="안내글",
-                    value=f"[바로가기](https://discord.com/channels/{guild.id}/{channel.id}/{message_id})",
+                    name="문의방을 볼 수 있는 역할",
+                    value=(" ".join(r.mention for r in viewers) if viewers else "지정된 역할 없음 (서버 관리자만 볼 수 있어요)"),
                     inline=False,
                 )
         elif channel_id:
@@ -2243,8 +2317,8 @@ async def generic_remove_cb(interaction: discord.Interaction, 기능: str, 값: 
     elif 기능 == "인증지급": gs["auth_role_ids"] = []; result = "🗑️ 인증지급 역할 목록을 비웠습니다."
     elif 기능 == "문의함" and gs.get("inquiry_channel"):
         await _delete_inquiry_panel(interaction.guild, gs)
-        gs.pop("inquiry_channel", None); gs.pop("inquiry_panel_message", None)
-        result = "🗑️ 문의함 설정을 제거하고 안내글도 지웠습니다. (이미 열린 문의방은 그대로 남아요)"
+        gs.pop("inquiry_channel", None); gs.pop("inquiry_panel_message", None); gs.pop("inquiry_roles", None)
+        result = "🗑️ 문의함에 대한 안내글 등의 데이터를 제거합니다."
     elif store and store in gs: del gs[store]; result = f"🗑️ {기능} 설정을 제거했습니다."
     else:
         await interaction.response.send_message("❌ 제거할 설정이 없습니다.", ephemeral=True); return
