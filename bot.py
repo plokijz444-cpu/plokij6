@@ -1296,7 +1296,7 @@ def build_guide_embed(guild_id: int, page: str) -> discord.Embed:
 
     if page == "common":
         embed.title = "🧰 공통 명령어"
-        embed.description = "기능을 켜고, 값을 설정하고, 관리하는 명령어입니다. (기본적으로 관리자 전용)"
+        embed.description = "기능을 켜고, 값을 설정하고, 관리하는 기본 명령어입니다. (가이드는 활성화 없이 누구나 사용 가능)"
         embed.add_field(
             name="🔌 기능 켜고 끄기",
             value=(
@@ -1422,88 +1422,69 @@ async def guide_cb(interaction: discord.Interaction):
     view.interaction = interaction
 
 
-# ---------- /번역 (모든 사용자 사용 가능, 활성화 후 표시) ----------
-@app_commands.choices(언어=[
-    app_commands.Choice(name="English", value="en"),
-    app_commands.Choice(name="日本語", value="ja"),
+# ---------- /번역 (모든 사용자 사용 가능: 지속 번역 모드) ----------
+TRANSLATION_LANGUAGES = [
+    app_commands.Choice(name="영어", value="en"),
+    app_commands.Choice(name="일본어", value="ja"),
     app_commands.Choice(name="한국어", value="ko"),
-])
-@app_commands.describe(언어="번역 결과 언어를 선택하세요.", 내용="번역할 문장이나 약자/신조어를 입력하세요.")
+]
+TRANSLATION_LANGUAGE_NAMES = {"en": "영어", "ja": "일본어", "ko": "한국어"}
+
+SLANG_MEANINGS = {
+    "ty": "thank you", "thx": "thanks", "tx": "thanks", "gg": "good game",
+    "ggs": "good games", "ggwp": "good game, well played", "wp": "well played",
+    "ez": "easy", "ezz": "easy", "np": "no problem", "nvm": "never mind",
+    "yw": "you're welcome", "pls": "please", "plz": "please", "brb": "be right back",
+    "afk": "away from keyboard", "idk": "I don't know", "ikr": "I know, right",
+    "imo": "in my opinion", "imho": "in my humble opinion", "tbh": "to be honest",
+    "ngl": "not gonna lie", "btw": "by the way", "fyi": "for your information",
+    "asap": "as soon as possible", "omg": "oh my god", "lol": "laughing out loud",
+    "lmao": "that's hilarious", "smh": "shaking my head", "rn": "right now",
+    "fr": "for real", "irl": "in real life", "wyd": "what are you doing",
+    "wdym": "what do you mean", "wym": "what do you mean", "hbu": "how about you",
+    "wbu": "what about you", "jk": "just kidding", "gl": "good luck", "hf": "have fun",
+    "glhf": "good luck, have fun", "omw": "on my way", "ttyl": "talk to you later",
+    "cya": "see you", "bc": "because", "u": "you", "ur": "your", "r": "are",
+    "k": "okay", "kk": "okay",
+}
+
+def expand_slang(value: str) -> str:
+    pattern = re.compile(r"(?<!\w)([A-Za-z]+(?:/[A-Za-z]+)?)(?!\w)")
+    return pattern.sub(lambda m: SLANG_MEANINGS.get(m.group(1).lower(), m.group(1)), value)
+
+async def translate_text(text_to_translate: str, language: str) -> str:
+    expanded = expand_slang(text_to_translate)
+    timeout = aiohttp.ClientTimeout(total=20)
+    params = {"client": "gtx", "sl": "auto", "tl": language, "dt": "t", "q": expanded}
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get("https://translate.googleapis.com/translate_a/single", params=params) as response:
+            response.raise_for_status()
+            data = await response.json(content_type=None)
+    translated = "".join(part[0] for part in (data[0] or []) if isinstance(part, list) and part and isinstance(part[0], str)).strip()
+    if not translated:
+        raise ValueError("번역 결과가 비어 있습니다.")
+    return translated
+
+@app_commands.choices(언어=TRANSLATION_LANGUAGES)
+@app_commands.describe(언어="이후 내가 보내는 메시지를 번역할 언어를 선택하세요.")
 @app_commands.guild_only()
-async def translate_cb(interaction: discord.Interaction, 언어: app_commands.Choice[str], 내용: str):
-    text_to_translate = 내용.strip()
-    if not text_to_translate:
-        await interaction.response.send_message("번역할 문장이나 약자를 입력해 주세요.", ephemeral=True)
-        return
-    if len(text_to_translate) > 1500:
-        await interaction.response.send_message("한 번에 최대 1,500자까지 번역할 수 있습니다.", ephemeral=True)
-        return
+async def translate_cb(interaction: discord.Interaction, 언어: app_commands.Choice[str]):
+    gs = get_gs(interaction.guild.id)
+    modes = gs.setdefault("translation_modes", {})
+    modes[str(interaction.user.id)] = 언어.value
+    save_settings(GUILD_SETTINGS)
+    await interaction.response.send_message(
+        f"🌐 번역 모드를 켰어요! 이제 보내는 메시지에 **{TRANSLATION_LANGUAGE_NAMES[언어.value]}** 번역을 답장으로 달게요.\n중지하려면 `/번역중지`를 사용하세요.",
+        ephemeral=True,
+    )
 
-    # 자주 쓰는 영어 채팅/게임 약자를 뜻이 분명한 영어 표현으로 먼저 풀어 씁니다.
-    # 예: ty -> thank you, gg -> good game, ez -> easy
-    slang_meanings = {
-        "ty": "thank you", "thx": "thanks", "tx": "thanks",
-        "gg": "good game", "ggs": "good games", "ggwp": "good game, well played",
-        "wp": "well played", "ez": "easy", "ezz": "easy",
-        "np": "no problem", "nvm": "never mind", "yw": "you're welcome",
-        "pls": "please", "plz": "please", "ppl": "people",
-        "brb": "be right back", "afk": "away from keyboard",
-        "idk": "I don't know", "ikr": "I know, right", "imo": "in my opinion",
-        "imho": "in my humble opinion", "tbh": "to be honest", "ngl": "not gonna lie",
-        "btw": "by the way", "fyi": "for your information", "asap": "as soon as possible",
-        "omg": "oh my god", "lol": "laughing out loud", "lmao": "that's hilarious",
-        "rofl": "rolling on the floor laughing", "smh": "shaking my head",
-        "rn": "right now", "fr": "for real", "irl": "in real life",
-        "wyd": "what are you doing", "wdym": "what do you mean", "wym": "what do you mean",
-        "hbu": "how about you", "wbu": "what about you", "jk": "just kidding",
-        "gl": "good luck", "hf": "have fun", "glhf": "good luck, have fun",
-        "omw": "on my way", "ttyl": "talk to you later", "cya": "see you",
-        "bc": "because", "b/c": "because", "u": "you", "ur": "your",
-        "r": "are", "thx": "thanks", "k": "okay", "kk": "okay",
-    }
-
-    def expand_slang(value: str) -> str:
-        # 단어 경계를 기준으로 치환해 다른 단어 안의 글자는 바꾸지 않습니다.
-        pattern = re.compile(r"(?<!\w)([A-Za-z]+(?:/[A-Za-z]+)?)(?!\w)")
-        return pattern.sub(lambda match: slang_meanings.get(match.group(1).lower(), match.group(1)), value)
-
-    expanded_text = expand_slang(text_to_translate)
-    language_names = {"en": "English", "ja": "日本語", "ko": "한국어"}
-    await interaction.response.defer(thinking=True)
-    try:
-        timeout = aiohttp.ClientTimeout(total=20)
-        url = "https://translate.googleapis.com/translate_a/single"
-        params = {
-            "client": "gtx",
-            "sl": "auto",
-            "tl": 언어.value,
-            "dt": "t",
-            "q": expanded_text,
-        }
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(url, params=params) as response:
-                response.raise_for_status()
-                data = await response.json(content_type=None)
-        translated = "".join(
-            part[0] for part in (data[0] or [])
-            if isinstance(part, list) and part and isinstance(part[0], str)
-        ).strip()
-        if not translated:
-            raise ValueError("번역 결과가 비어 있습니다.")
-        embed = discord.Embed(
-            title=f"🌐 번역 결과 · {language_names[언어.value]}",
-            color=discord.Color.blurple(),
-        )
-        embed.add_field(name="원문", value=text_to_translate[:1024], inline=False)
-        if expanded_text.casefold() != text_to_translate.casefold():
-            embed.add_field(name="약자 풀이", value=expanded_text[:1024], inline=False)
-        embed.description = translated[:4000]
-        await interaction.followup.send(embed=embed)
-    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, IndexError, TypeError) as exc:
-        await interaction.followup.send(
-            f"❌ 번역에 실패했습니다. 잠시 후 다시 시도해 주세요. (`{type(exc).__name__}`)",
-            ephemeral=True,
-        )
+@app_commands.guild_only()
+async def stop_translation_cb(interaction: discord.Interaction):
+    gs = get_gs(interaction.guild.id)
+    modes = gs.setdefault("translation_modes", {})
+    modes.pop(str(interaction.user.id), None)
+    save_settings(GUILD_SETTINGS)
+    await interaction.response.send_message("⏹️ 번역 모드를 중지했어요.", ephemeral=True)
 
 # ====================================================================
 # 📨 문의함 (버튼으로 문의자 + 관리자 + 지정 역할만 보는 비공개 문의방 열기)
@@ -1516,6 +1497,7 @@ INQUIRY_CLOSE_DELAY = 5
 _INQUIRY_LOCKS = {}
 _CLOSING_INQUIRIES = set()
 _LAST_REMINDER = {}                       # 채널 ID -> 마지막으로 올린 '닫기' 알림 메시지 ID
+_PANEL_REPLACEMENTS = set()
 INQUIRY_REMINDER_INTERVAL = 300           # 5분
 INQUIRY_REMINDER_TITLE = "🔒 문의가 끝나셨나요?"
 
@@ -1552,10 +1534,11 @@ async def _delete_inquiry_panel(guild: discord.Guild, gs: dict):
     channel = guild.get_channel(gs.get("inquiry_channel", 0))
     message_id = gs.get("inquiry_panel_message")
     if channel and message_id:
+        _PANEL_REPLACEMENTS.add(message_id)
         try:
             await (await channel.fetch_message(message_id)).delete()
         except discord.HTTPException:
-            pass
+            _PANEL_REPLACEMENTS.discard(message_id)
 
 async def open_inquiry_channel(interaction: discord.Interaction):
     guild = interaction.guild
@@ -1663,7 +1646,7 @@ class InquiryOpenView(discord.ui.View):
     async def open_inquiry(self, interaction: discord.Interaction, button: discord.ui.Button):
         await open_inquiry_channel(interaction)
 
-async def _close_ticket(interaction: discord.Interaction, owner_id: int, notice: str):
+async def _close_ticket(interaction: discord.Interaction, owner_id: int, notice: str, silent: bool = False):
     """문의방/신고방 공통 닫기. 문의를 연 일반 유저만 닫을 수 없습니다."""
     channel = interaction.channel
     if not owner_id:
@@ -1677,7 +1660,7 @@ async def _close_ticket(interaction: discord.Interaction, owner_id: int, notice:
         return
     _CLOSING_INQUIRIES.add(channel.id)
     try:
-        await interaction.response.send_message(notice)
+        await interaction.response.send_message(notice, ephemeral=silent)
         await asyncio.sleep(INQUIRY_CLOSE_DELAY)
         await channel.delete(reason=f"문의/신고 종료 (닫은 사람: {interaction.user})")
         _LAST_REMINDER.pop(channel.id, None)
@@ -1698,7 +1681,7 @@ class InquiryCloseView(discord.ui.View):
     async def close_inquiry(self, interaction: discord.Interaction, button: discord.ui.Button):
         await _close_ticket(
             interaction, _inquiry_owner_id(interaction.channel),
-            f"🔒 낫또봇이 {INQUIRY_CLOSE_DELAY}초뒤 문의를 중단합니다....",
+            f"🔒 잠시만 기다려 주세요! {INQUIRY_CLOSE_DELAY}초 후 문의방이 닫혀요. 🌷",
         )
 
 class InquiryPanelModal(discord.ui.Modal):
@@ -1724,6 +1707,7 @@ class InquiryPanelModal(discord.ui.Modal):
             description=self.body_input.value.strip(),
             color=discord.Color.blurple(),
         )
+        embed.add_field(name="💡 사용 도움말", value="아래 **문의함 열기** 버튼을 누르면 비공개 문의방이 만들어집니다. 문의 내용은 새로 열린 방에 작성해 주세요.\n안내 문구에서 `@닉네임` 또는 `@들어온사용자님`처럼 멘션을 사용할 수 있어요.", inline=False)
         embed.set_footer(text="아래 버튼을 눌러 문의함을 열어 주세요.")
         await interaction.response.defer(ephemeral=True)
         gs = get_gs(guild.id)
@@ -1738,6 +1722,7 @@ class InquiryPanelModal(discord.ui.Modal):
         await _delete_inquiry_panel(guild, gs)  # 이전 안내글이 있으면 정리
         gs["inquiry_channel"] = channel.id
         gs["inquiry_panel_message"] = message.id
+        gs["inquiry_panel_description"] = self.body_input.value.strip()
         gs["inquiry_roles"] = list(self.role_ids)
         save_settings(GUILD_SETTINGS)
         roles_text = " ".join(f"<@&{rid}>" for rid in self.role_ids)
@@ -1869,17 +1854,18 @@ async def _delete_report_panel(guild: discord.Guild, gs: dict):
     channel = guild.get_channel(gs.get("report_channel", 0))
     message_id = gs.get("report_panel_message")
     if channel and message_id:
+        _PANEL_REPLACEMENTS.add(message_id)
         try:
             await (await channel.fetch_message(message_id)).delete()
         except discord.HTTPException:
-            pass
+            _PANEL_REPLACEMENTS.discard(message_id)
 
 class ReportOpenView(discord.ui.View):
     """안내글 아래의 '신고함 열기' 버튼 (봇을 재시작해도 동작하는 영구 버튼)"""
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="신고함 열기", emoji="🚨", style=discord.ButtonStyle.danger, custom_id="natto:report:open")
+    @discord.ui.button(label="신고함 열기", emoji="🚨", style=discord.ButtonStyle.primary, custom_id="natto:report:open")
     async def open_report(self, interaction: discord.Interaction, button: discord.ui.Button):
         guild = interaction.guild
         if guild is None or not isinstance(interaction.user, discord.Member):
@@ -1888,15 +1874,18 @@ class ReportOpenView(discord.ui.View):
         if not is_on(guild.id, REPORT_FEATURE):
             await interaction.response.send_message(INQUIRY_DISABLED_TEXT, ephemeral=True)
             return
-        await interaction.response.send_modal(ReportReasonModal())
+        view = discord.ui.View(timeout=180)
+        view.add_item(ReportTargetSelect())
+        await interaction.response.send_message("먼저 **신고할 사용자**를 선택해 주세요. 선택한 다음 신고 사유를 입력할 수 있어요.", view=view, ephemeral=True)
 
 class ReportReasonModal(discord.ui.Modal):
-    """1단계: 신고 사유 작성"""
-    def __init__(self):
+    """신고 대상 선택 후 신고 사유를 입력합니다."""
+    def __init__(self, target_id: int):
         super().__init__(title="신고 사유 작성", timeout=600)
+        self.target_id = target_id
         self.reason_input = discord.ui.TextInput(
             label="신고 사유", style=discord.TextStyle.paragraph, required=True, max_length=900,
-            placeholder="누가, 언제, 어떤 일을 했는지 자세히 적어주세요.",
+            placeholder="언제, 어떤 일이 있었는지 구체적으로 적어주세요.",
         )
         self.add_item(self.reason_input)
 
@@ -1905,21 +1894,23 @@ class ReportReasonModal(discord.ui.Modal):
         if not reason:
             await interaction.response.send_message("❌ 신고 사유를 입력해 주세요.", ephemeral=True)
             return
-        view = discord.ui.View(timeout=180)
-        view.add_item(ReportTargetSelect(reason))
-        await interaction.response.send_message(
-            "**신고할 사람**을 선택하세요. 닉네임을 검색해 고른 뒤 Enter를 누르면 신고방이 열립니다.",
-            view=view, ephemeral=True,
-        )
+        target = interaction.guild.get_member(self.target_id)
+        if target is None:
+            await interaction.response.send_message("❌ 서버에서 찾을 수 없는 사용자입니다. 다시 신고해 주세요.", ephemeral=True)
+            return
+        await create_report_room(interaction, target, reason)
 
 class ReportTargetSelect(discord.ui.UserSelect):
-    """2단계: 신고할 사람 선택"""
-    def __init__(self, reason: str):
-        super().__init__(placeholder="신고할 사람의 닉네임을 선택하세요", min_values=1, max_values=1)
-        self.reason = reason
+    """1단계: 신고할 사람 선택"""
+    def __init__(self):
+        super().__init__(placeholder="먼저 신고할 사람을 선택하세요", min_values=1, max_values=1)
 
     async def callback(self, interaction: discord.Interaction):
-        await create_report_room(interaction, self.values[0], self.reason)
+        target = interaction.guild.get_member(self.values[0].id)
+        if target is None or target.bot or target.id == interaction.user.id:
+            await interaction.response.send_message("❌ 본인이나 봇은 신고할 수 없어요. 다른 사용자를 선택해 주세요.", ephemeral=True)
+            return
+        await interaction.response.send_modal(ReportReasonModal(target.id))
 
 async def create_report_room(interaction: discord.Interaction, picked, reason: str):
     guild = interaction.guild
@@ -2084,8 +2075,16 @@ async def _report_decide(interaction: discord.Interaction, agree: bool):
                 await interaction.edit_original_response(view=disabled)
             except discord.HTTPException:
                 pass
-        await channel.send(embed=done, view=ReportCloseView() if finished else None,
-                           allowed_mentions=discord.AllowedMentions.none())
+        if finished:
+            done.add_field(name="⏳ 마무리 안내", value="🍀 처리가 완료됐어요! 이 신고방은 **5초 후 자동으로 닫힙니다.**", inline=False)
+            await channel.send(embed=done, allowed_mentions=discord.AllowedMentions.none())
+            await asyncio.sleep(5)
+            try:
+                await channel.delete(reason="신고 처리 완료 후 5초 자동 종료")
+            except discord.HTTPException as exc:
+                print(f"신고방 자동 종료 실패: {exc}")
+        else:
+            await channel.send(embed=done, allowed_mentions=discord.AllowedMentions.none())
     finally:
         _DECIDING_REPORTS.discard(message.id)
 
@@ -2094,11 +2093,11 @@ class ReportDecisionView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="동의", emoji="✅", style=discord.ButtonStyle.success, custom_id="natto:report:agree")
+    @discord.ui.button(label="동의", emoji="✅", style=discord.ButtonStyle.primary, custom_id="natto:report:agree")
     async def agree(self, interaction: discord.Interaction, button: discord.ui.Button):
         await _report_decide(interaction, True)
 
-    @discord.ui.button(label="거절", emoji="❌", style=discord.ButtonStyle.danger, custom_id="natto:report:reject")
+    @discord.ui.button(label="거절", emoji="❌", style=discord.ButtonStyle.primary, custom_id="natto:report:reject")
     async def reject(self, interaction: discord.Interaction, button: discord.ui.Button):
         await _report_decide(interaction, False)
 
@@ -2112,7 +2111,8 @@ class ReportCloseView(discord.ui.View):
         info = _report_info(interaction.channel)
         await _close_ticket(
             interaction, info[0] if info else 0,
-            f"🔒 낫또봇이 {INQUIRY_CLOSE_DELAY}초뒤 신고방을 닫습니다....",
+            f"🔒 처리가 끝났어요! {INQUIRY_CLOSE_DELAY}초 후 신고방이 닫혀요. 🌷",
+            silent=True,
         )
 
 class ReportPanelModal(discord.ui.Modal):
@@ -2133,6 +2133,7 @@ class ReportPanelModal(discord.ui.Modal):
             await interaction.response.send_message("❌ 선택한 채널을 찾을 수 없습니다. 다시 `/설정 신고함`을 실행해 주세요.", ephemeral=True)
             return
         embed = discord.Embed(title=REPORT_PANEL_TITLE, description=self.body_input.value.strip(), color=discord.Color.red())
+        embed.add_field(name="💡 사용 도움말", value="아래 **신고함 열기** 버튼을 누르고, 먼저 신고할 사용자를 선택한 뒤 신고 사유를 작성해 주세요. 신고방은 신고자와 담당 관리자에게만 공개됩니다.", inline=False)
         embed.set_footer(text="아래 버튼을 눌러 신고함을 열어 주세요.")
         await interaction.response.defer(ephemeral=True)
         gs = get_gs(guild.id)
@@ -2147,6 +2148,7 @@ class ReportPanelModal(discord.ui.Modal):
         await _delete_report_panel(guild, gs)
         gs["report_channel"] = channel.id
         gs["report_panel_message"] = message.id
+        gs["report_panel_description"] = self.body_input.value.strip()
         save_settings(GUILD_SETTINGS)
         done = discord.Embed(
             title="✅ 신고함 설정 완료",
@@ -2278,7 +2280,7 @@ FEATURES = {
     },
     # ---------- 기타 ----------
     "번역": {
-        "cat": "기타", "desc": "문장과 ty·gg·ez 같은 약자/게임 신조어도 뜻을 풀어 영어·일본어·한국어로 번역합니다. (모든 사용자 사용 가능)", "usage": "`언어` `내용`",
+        "cat": "기타", "desc": "선택한 언어로 이후 본인이 보내는 메시지를 자동 번역해 원문에 답장합니다. `/번역중지`로 종료합니다. (모든 사용자 사용 가능)", "usage": "`언어`",
         "top": translate_cb,
     },
     "가이드": {
@@ -2638,7 +2640,13 @@ def build_guild_commands(guild_id: int) -> list:
     ]
     # 번역만 공개합니다. 나머지 기능 명령어는 모두 서버 관리자 권한이 있어야
     # 명령어 목록에 표시되고 실행할 수 있습니다. 봇 역할 순위와는 별개의 설정입니다.
-    public_commands = {"번역"}
+    public_commands = {"번역", "번역중지", "가이드"}
+    # 번역과 가이드는 활성화 여부와 관계없이 항상 사용할 수 있습니다.
+    for always_name in ("번역", "가이드"):
+        if always_name not in enabled:
+            f = FEATURES[always_name]
+            result.append(app_commands.Command(name=always_name, description=f["desc"][:100], callback=f["top"]))
+    result.append(app_commands.Command(name="번역중지", description="켜 둔 자동 번역을 중지합니다.", callback=stop_translation_cb))
     for k, f in FEATURES.items():
         if k in enabled and "top" in f:
             command = app_commands.Command(
@@ -2650,7 +2658,7 @@ def build_guild_commands(guild_id: int) -> list:
             result.append(command)
     # 디스코드의 기본 표시 권한뿐 아니라 실행 시에도 서버 관리자 여부를 검사합니다.
     for command in result:
-        if command.name != "번역":
+        if command.name not in public_commands:
             command.checks.append(_server_admin_check)
     return result
 
@@ -2778,7 +2786,8 @@ def build_deactivate_all_command() -> app_commands.Command:
     return _with_default_permissions(app_commands.Command(name="모두비활성화", description="모든 기능을 한 번에 비활성화합니다.", callback=deactivate_all_cb), discord.Permissions(administrator=True))
 
 # ================= [ 안내 문구 멘션 치환 ] =================
-_NICK_MENTION_RE = re.compile(r"\(@([^()\n@]{1,64})\)")
+_NICK_MENTION_RE = re.compile(r"\(@?([^()\n@]{1,64}?)\)")
+_BARE_NICK_MENTION_RE = re.compile(r"@([^@\s()]{1,64}?)(님)?(?=$|[\s.,!?~…])")
 
 def _find_member_by_name(guild: discord.Guild, name: str):
     """서버 닉네임·본 닉네임(표시 이름/계정 이름)이 정확히 같은 멤버를 찾습니다. (대소문자 무시)"""
@@ -2801,7 +2810,44 @@ def render_placeholders(text: str, guild: discord.Guild, joined=None, me=None) -
     def _replace(match):
         member = _find_member_by_name(guild, match.group(1))
         return member.mention if member else match.group(0)
-    return _NICK_MENTION_RE.sub(_replace, text)
+    text = _NICK_MENTION_RE.sub(_replace, text)
+    def _replace_bare(match):
+        name, suffix = match.group(1), match.group(2) or ""
+        member = _find_member_by_name(guild, name)
+        return (member.mention + suffix) if member else match.group(0)
+    return _BARE_NICK_MENTION_RE.sub(_replace_bare, text)
+
+# ================= [ 문의함·신고함 안내글 삭제 시 자동 복구 ] =================
+@bot.event
+async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent):
+    guild = bot.get_guild(payload.guild_id) if payload.guild_id else None
+    if guild is None:
+        return
+    gs = GUILD_SETTINGS.get(guild.id, {})
+    configs = [
+        ("inquiry_panel_message", "inquiry_channel", "inquiry_panel_description", INQUIRY_PANEL_TITLE, discord.Color.blurple(), InquiryOpenView(), "아래 **문의함 열기** 버튼을 누르면 비공개 문의방이 만들어집니다. 문의 내용은 새로 열린 방에 작성해 주세요.\n안내 문구에서 `@닉네임` 또는 `@들어온사용자님`처럼 멘션을 사용할 수 있어요."),
+        ("report_panel_message", "report_channel", "report_panel_description", REPORT_PANEL_TITLE, discord.Color.red(), ReportOpenView(), "아래 **신고함 열기** 버튼을 누르고, 먼저 신고할 사용자를 선택한 뒤 신고 사유를 작성해 주세요. 신고방은 신고자와 담당 관리자에게만 공개됩니다."),
+    ]
+    if payload.message_id in _PANEL_REPLACEMENTS:
+        _PANEL_REPLACEMENTS.discard(payload.message_id)
+        return
+    for msg_key, channel_key, desc_key, title, color, view, help_text in configs:
+        if gs.get(msg_key) != payload.message_id:
+            continue
+        channel = guild.get_channel(gs.get(channel_key, 0))
+        if channel is None:
+            return
+        body = gs.get(desc_key, "")
+        embed = discord.Embed(title=title, description=body, color=color)
+        embed.add_field(name="💡 사용 도움말", value=help_text, inline=False)
+        embed.set_footer(text="아래 버튼을 눌러 열어 주세요.")
+        try:
+            new_message = await channel.send(embed=embed, view=view)
+            gs[msg_key] = new_message.id
+            save_settings(GUILD_SETTINGS)
+        except discord.HTTPException as exc:
+            print(f"{title} 안내글 자동 복구 실패: {exc}")
+        return
 
 # ================= [ 입장 / 퇴장 ] =================
 @bot.event
@@ -2814,6 +2860,7 @@ async def on_member_join(member: discord.Member):
         channel = guild.get_channel(gs.get("auth_channel", 0))
         form = str(gs.get("auth_form", "")).replace("\\n", "\n").strip()
         if channel and form:
+            form = form + "\n\n💡 **멘션 도움말**\n`@들어온사용자` 또는 `@들어온사용자님` → 입장한 사용자 멘션\n`@자기자신` → 인증 중인 사용자 멘션\n`@닉네임` 또는 `@닉네임님` → 해당 멤버 멘션 (띄어쓰기 없이 조사 입력 가능)"
             text = render_placeholders(form, guild, joined=member, me=member)
             try:
                 await channel.send(text[:2000], allowed_mentions=discord.AllowedMentions(users=True, roles=True, everyone=False))
@@ -2854,6 +2901,7 @@ async def on_message(message: discord.Message):
 
     settings = GUILD_SETTINGS.get(message.guild.id, {})
     content = message.content or ""
+
     folded_content = content.casefold()
 
     # 제재단어가 검열단어보다 우선합니다. 등록된 단어는 대소문자를 구분하지 않습니다.
@@ -2892,6 +2940,20 @@ async def on_message(message: discord.Message):
             except discord.HTTPException as exc:
                 print(f"검열 메시지 재게시 실패: {exc}")
             return
+
+    # 검열을 통과한 일반 메시지만 번역합니다.
+    modes = settings.get("translation_modes", {})
+    language = modes.get(str(message.author.id)) if isinstance(modes, dict) else None
+    if language in TRANSLATION_LANGUAGE_NAMES and content.strip() and not content.startswith("/"):
+        try:
+            translated = await translate_text(content[:1500], language)
+            await message.reply(
+                f"🌐 **{TRANSLATION_LANGUAGE_NAMES[language]} 번역**\n{translated[:1900]}",
+                mention_author=False,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, IndexError, TypeError) as exc:
+            print(f"자동 번역 실패 (user={message.author.id}): {type(exc).__name__}: {exc}")
 
     await bot.process_commands(message)
 
