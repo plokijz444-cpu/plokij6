@@ -80,6 +80,11 @@ intents.members = True
 
 class NattoBot(commands.Bot):
     async def setup_hook(self):
+        # 삭제된 기능(예: 서버청소)이 저장된 활성화 목록에 남아 있으면 정리합니다.
+        for _gs in GUILD_SETTINGS.values():
+            if isinstance(_gs.get("enabled"), list):
+                _gs["enabled"] = [k for k in _gs["enabled"] if k in FEATURES]
+        save_settings(GUILD_SETTINGS)
         # 전역 명령어로 기능 활성화 및 전체 활성화/비활성화를 등록합니다.
         self.tree.add_command(build_activation_group())
         self.tree.add_command(build_activate_all_command())
@@ -87,6 +92,11 @@ class NattoBot(commands.Bot):
         # 문의함 버튼은 봇이 재시작되어도 계속 눌릴 수 있도록 영구 등록합니다.
         self.add_view(InquiryOpenView())
         self.add_view(InquiryCloseView())
+        self.add_view(ReportOpenView())
+        self.add_view(ReportDecisionView())
+        self.add_view(ReportCloseView())
+        # 문의방 '닫기' 버튼이 대화에 묻히지 않도록 5분마다 다시 올려 줍니다.
+        self._inquiry_reminder_task = asyncio.create_task(inquiry_reminder_loop())
         # 전역 명령어의 최신 관리자 권한 설정을 디스코드에 반영합니다.
         await self.tree.sync()
         # 서버별 명령어를 전부 재등록/동기화합니다. 비활성 서버도 동기화해야
@@ -422,7 +432,7 @@ def make_reset(key: str, label: str):
     return cb
 
 # ====================================================================
-# 🛠️ 개별 기능 명령어 (/인증완료 /제재 /제재지우기 /추방 /추방해제 /청소 /서버청소 /가이드)
+# 🛠️ 개별 기능 명령어 (/인증완료 /제재 /제재지우기 /추방 /추방해제 /청소 /가이드)
 # ====================================================================
 
 @app_commands.describe(유저="인증을 승인할 유저를 선택하세요.", 추가역할="성별이나 추가로 줄 특수 역할을 선택하세요. (선택사항)")
@@ -811,7 +821,7 @@ async def unban_member_cb(interaction: discord.Interaction):
     view.interaction = interaction
 
 
-# ---------- 청소 / 서버청소 ----------
+# ---------- 청소 ----------
 RUNNING_CLEANS = set()   # 서버별 동시 청소 방지
 
 def _is_category_channel(channel):
@@ -1222,199 +1232,7 @@ async def clean_channel_cb(interaction: discord.Interaction):
     finally:
         RUNNING_CLEANS.discard(guild.id)
 
-async def collect_all_threads(guild: discord.Guild) -> dict:
-    """활성 스레드와 접근 가능한 보관 스레드/포럼 게시글을 수집합니다."""
-    found = {thread.id: thread for thread in getattr(guild, "threads", [])}
-    try:
-        for thread in await guild.active_threads():
-            found[thread.id] = thread
-    except (discord.HTTPException, AttributeError):
-        pass
-
-    for channel in guild.channels:
-        if not isinstance(channel, (discord.TextChannel, discord.ForumChannel)):
-            continue
-        perms = channel.permissions_for(guild.me)
-        if not (perms.view_channel and perms.read_message_history):
-            continue
-        try:
-            async for thread in channel.archived_threads(limit=None):
-                found[thread.id] = thread
-            if isinstance(channel, discord.TextChannel) and perms.manage_threads:
-                async for thread in channel.archived_threads(limit=None, private=True):
-                    found[thread.id] = thread
-        except (discord.HTTPException, AttributeError):
-            # 접근할 수 없는 보관 스레드는 아래 건너뜀 통계에 포함됩니다.
-            continue
-    return found
-
-@app_commands.default_permissions(administrator=True)
-@app_commands.guild_only()
-@admin_only
-async def clean_server_cb(interaction: discord.Interaction):
-    """서버의 채널을 복제하고 고정 메시지/포스트를 복원한 뒤 원본 채널을 삭제합니다."""
-    guild = interaction.guild
-    if guild.id in RUNNING_CLEANS:
-        await interaction.response.send_message(
-            "⏳ 이 서버에서 이미 청소가 진행 중입니다. 끝난 뒤 다시 시도해 주세요.",
-            ephemeral=True,
-        )
-        return
-
-    warn_text = (
-        f"🧨 **경고: 서버청소**\n"
-        f"{interaction.user.mention}님, 서버의 모든 카테고리와 채널을 같은 설정으로 새로 만들고 기존 채널을 삭제합니다.\n"
-        f"채널 설정·권한·순서와, 낫또봇에 저장된 입장로그 등 채널 설정은 새 채널 ID로 자동 이전됩니다.\n"
-        f"텍스트 채널의 고정 메시지와 포럼의 고정 게시글은 복원되며, 일반 메시지와 일반 스레드는 복원되지 않습니다.\n"
-        f"⚠️ 작업 도중 복제/복원이 실패하면 원본 채널은 삭제하지 않고, 새로 만든 복제본만 정리합니다.\n\n"
-        f"✅ 진행 / ❌ 취소 (본인만 선택 가능, {CONFIRM_TIMEOUT}초 후 자동 취소)"
-    )
-    if not await confirm_by_reaction(interaction, warn_text, "서버청소"):
-        return
-
-    RUNNING_CLEANS.add(guild.id)
-    created = []
-    snapshots = []
-    channel_map = {}
-    originals_deleted = 0
-    try:
-        try:
-            await interaction.followup.send(
-                "🧹 서버 전체 채널을 백업하고 복제합니다. 원본 채널은 복제가 끝나기 전까지 삭제하지 않습니다.",
-                ephemeral=True,
-            )
-        except discord.HTTPException:
-            pass
-
-        # 1) 먼저 모든 채널 설정과 고정 콘텐츠를 메모리에 저장합니다.
-        original_channels = list(guild.channels)
-        for channel in original_channels:
-            snapshots.append(await _snapshot_channel(channel, guild))
-
-        # 2) 카테고리를 먼저 만들고, 그다음 나머지 채널을 원래 카테고리에 연결합니다.
-        ordered_snapshots = (
-            [snap for snap in snapshots if snap["kind"] == "category"]
-            + [snap for snap in snapshots if snap["kind"] != "category"]
-        )
-        for snap in ordered_snapshots:
-            old_category_id = snap.get("category_id")
-            new_category = channel_map.get(old_category_id) if old_category_id else None
-            new_channel = await _create_channel_copy(guild, snap, category=new_category)
-            created.append(new_channel)
-            channel_map[snap["id"]] = new_channel
-
-        # 3) 복제본이 전부 만들어진 뒤 고정 메시지와 고정 포럼 게시글을 복원합니다.
-        for snap in snapshots:
-            if snap["kind"] == "category":
-                continue
-            await _restore_channel_pins(channel_map[snap["id"]], snap)
-
-        # 4) 모든 복제와 복원이 성공한 경우에만 원본을 삭제합니다.
-        delete_order = (
-            [snap for snap in reversed(snapshots) if snap["kind"] != "category"]
-            + [snap for snap in reversed(snapshots) if snap["kind"] == "category"]
-        )
-        delete_errors = []
-        for snap in delete_order:
-            old_channel = snap["old"]
-            try:
-                await old_channel.delete(reason=f"/서버청소 (집행자: {interaction.user})")
-                originals_deleted += 1
-            except discord.HTTPException as exc:
-                delete_errors.append(f"{getattr(old_channel, 'name', snap['id'])}: {exc}")
-
-        # 5) 카테고리 순서와 각 카테고리 안의 채널 순서를 따로 복원합니다.
-        # 전체 채널을 position 하나로 정렬하면 음성/텍스트 채널과 카테고리 순서가 섞일 수 있습니다.
-        position_reason = "낫또봇 서버청소: 원래 채널 순서 복원"
-        category_snaps = sorted(
-            (snap for snap in snapshots if snap["kind"] == "category"),
-            key=lambda item: item.get("position", 0),
-        )
-        for position, snap in enumerate(category_snaps):
-            try:
-                await channel_map[snap["id"]].edit(
-                    position=position, reason=position_reason
-                )
-            except (discord.HTTPException, AttributeError):
-                pass
-
-        # 카테고리 밖 채널과 각 카테고리 내부 채널을 각각 원래 순서대로 정렬합니다.
-        parent_ids = [None] + [snap["id"] for snap in category_snaps]
-        for parent_id in parent_ids:
-            siblings = sorted(
-                (
-                    snap for snap in snapshots
-                    if snap["kind"] != "category"
-                    and snap.get("category_id") == parent_id
-                ),
-                key=lambda item: item.get("position", 0),
-            )
-            for position, snap in enumerate(siblings):
-                try:
-                    await channel_map[snap["id"]].edit(
-                        position=position, reason=position_reason
-                    )
-                except (discord.HTTPException, AttributeError):
-                    pass
-
-        _remap_saved_channel_ids(guild.id, {old_id: new.id for old_id, new in channel_map.items()})
-
-        embed = discord.Embed(
-            title="🧹 서버 전체 청소 완료",
-            color=discord.Color.dark_red(),
-            timestamp=discord.utils.utcnow(),
-        )
-        embed.add_field(name="📦 복제한 채널/카테고리", value=f"{len(created)}개", inline=True)
-        embed.add_field(name="🗑️ 삭제한 원본 채널/카테고리", value=f"{originals_deleted}개", inline=True)
-        embed.add_field(
-            name="🔒 설정",
-            value="채널 설정·권한·순서 및 낫또봇의 저장된 입장로그 등 채널 ID 설정을 새 ID로 갱신했습니다.",
-            inline=False,
-        )
-        embed.add_field(
-            name="📌 콘텐츠",
-            value="고정 메시지와 고정 포럼 게시글을 복원했습니다. 일반 메시지와 일반 스레드는 복원하지 않습니다.",
-            inline=False,
-        )
-        if delete_errors:
-            embed.add_field(
-                name="⚠️ 삭제하지 못한 원본",
-                value="일부 원본 채널은 권한 또는 Discord 오류로 남아 있을 수 있습니다. 중복 채널을 확인해 주세요.\n"
-                      + "\n".join(f"• {err}" for err in delete_errors[:8])[:1000],
-                inline=False,
-            )
-        await interaction.followup.send(embed=embed, ephemeral=True)
-
-    except Exception as exc:
-        # 복제 또는 콘텐츠 복원 단계에서 실패했다면 원본은 아직 삭제하지 않았으므로 복제본만 정리합니다.
-        if originals_deleted == 0 and created:
-            await _delete_created_channels(created)
-        try:
-            status = (
-                "원본 채널은 삭제하지 않았으며 생성한 복제본을 정리했습니다.\n"
-                if originals_deleted == 0 else
-                f"원본 채널 {originals_deleted}개가 이미 삭제되었을 수 있으니 서버 채널 목록을 확인해 주세요.\n"
-            )
-            await interaction.followup.send(
-                "❌ 서버청소 중 오류가 발생했습니다. " + status
-                + f"`{type(exc).__name__}: {str(exc)[:900]}`",
-                ephemeral=True,
-            )
-        except discord.HTTPException:
-            pass
-    finally:
-        RUNNING_CLEANS.discard(guild.id)
-
 # ---------- 가이드 ----------
-CATEGORY_WARN = {
-    "인증": "`인증방`·`인증지급`·`인증메세지` 중 하나라도 비어 있으면 신입에게 안내가 뜨지 않거나 역할이 지급되지 않아 **가입 단계가 멈춥니다.** `인증방`이 없으면 `/인증완료`도 실행되지 않아요.",
-    "제재": "`제재로그`가 비어 있으면 **`/제재`·`/제재지우기`를 쓸 수 없고**, 자동 제재는 처리돼도 로그가 남지 않습니다. `/추방`은 영구 차단이라 `/추방해제`로만 풀 수 있어요.",
-    "입퇴장": "로그 채널을 정하지 않으면 해당 입장/퇴장 기록이 남지 않습니다.",
-    "청소": "채널은 **새로 만들어지고 기존 채널은 삭제**되므로 되돌릴 수 없습니다. 고정 메시지와 고정 포럼 게시글만 복원되고, 일반 메시지와 스레드는 복원되지 않아요. 실행 전 ✅/❌ 확인창이 한 번 더 나옵니다.",
-    "문의": "봇에 **채널 관리** 권한이 있어야 문의방을 만들 수 있어요. 문의방(`문의함-번호`)은 안내글 채널 바로 아래에 생기고, 문의한 사람·서버 관리자·지정한 열람 역할만 볼 수 있습니다. `@everyone` 알림도 그 방을 볼 수 있는 사람에게만 가요. **문의 닫기**는 문의를 연 일반 유저를 뺀 모두가 쓸 수 있습니다. 기능을 끄면 버튼을 눌러도 비활성화 안내만 나오고, 안내글을 다시 쓰려면 `/제거 문의함` 후 `/설정 문의함`을 실행하세요.",
-    "기타": "",
-}
-
 # 개별 명령어를 실행하는 데 필요한 권한 (표에 없으면 관리자)
 PERM_LABELS = {
     "인증완료": "역할 관리 권한",
@@ -1462,6 +1280,7 @@ def build_guide_embed(guild_id: int, page: str) -> discord.Embed:
             keys = [k for k, f in FEATURES.items() if f["cat"] == cat]
             on = sum(1 for k in keys if k in enabled)
             lines.append(f"{emoji} **{cat}** — {desc} `{on}/{len(keys)}`")
+        lines.append("⚠️ **주의사항** — 인증·제재·활성화·비활성화가 안 될 때")
         embed.add_field(name="📚 카테고리  (켜짐/전체)", value="\n".join(lines), inline=False)
         embed.add_field(
             name="🧰 공통 명령어",
@@ -1503,9 +1322,42 @@ def build_guide_embed(guild_id: int, page: str) -> discord.Embed:
             value="`/역할주기 [대상] [역할]` — 선택한 멤버에게 역할을 지급합니다. (역할 관리 권한 · 봇보다 높은 역할은 불가)",
             inline=False,
         )
+        return embed
+
+    if page == "caution":
+        embed.title = "⚠️ 주의사항"
+        embed.description = "기능이 말을 듣지 않을 때, 어떤 문제가 생기는지와 해결 방법을 정리했어요."
+        embed.color = discord.Color.orange()
         embed.add_field(
-            name="💡 알아두세요",
-            value="`/설정` `/체크` `/제거` `/초기화` `/비활성화` `/역할주기` 는 기능을 하나 이상 켜면 나타납니다. 꺼진 기능은 `/설정`·`/체크` 목록에 보이지 않아요.",
+            name="🪪 인증이 안 될 때",
+            value=(
+                "**문제** `인증방`·`인증지급`·`인증메세지` 중 하나라도 꺼져 있거나 비어 있으면 신입에게 안내가 올라오지 않거나 역할이 지급되지 않아 가입 단계가 멈춰요. `인증방`이 없으면 `/인증완료`도 실행되지 않아요.\n"
+                "**해결** ① `/활성화`에서 세 기능을 켜세요. ② `/설정 인증방` `/설정 인증지급` `/설정 인증메세지`를 채우세요. ③ `/체크`로 잘 들어갔는지 확인하세요. ④ 봇 역할을 지급할 역할보다 위에 두고, 인증방에 메시지를 보낼 권한을 주세요."
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="🔨 제재가 안 될 때",
+            value=(
+                "**문제** `제재` 기능이 꺼져 있으면 `/제재` `/제재지우기` 명령어가 생기지 않고, `제재로그`가 비어 있으면 실행되지 않아요. 신고함의 **동의**를 눌러도 제재가 걸리지 않고요. 봇보다 역할이 높거나 같은 사람, 서버장, 봇은 제재할 수 없어요.\n"
+                "**해결** ① `/활성화`에서 제재 기능을 켜세요. ② `/설정 제재로그`로 로그 채널을 정하세요. ③ 봇에게 멤버 타임아웃·차단 권한을 주고, 봇 역할을 제재할 사람들보다 위로 올리세요."
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="🔌 활성화가 안 될 때",
+            value=(
+                "**문제** 활성화는 디스코드에 명령어를 등록하는 일이라, 등록에 실패하면 \"명령어 등록에 실패했습니다\" 안내가 뜨고 방금 켠 기능은 자동으로 취소돼요. 명령어가 목록에 안 보일 수도 있어요. 활성화는 서버 관리자만 할 수 있어요.\n"
+                "**해결** ① 1~2분 뒤 `/활성화`를 다시 실행하세요. ② 디스코드를 Ctrl+R로 새로고침하세요. ③ 계속 안 되면 봇을 `applications.commands` 범위가 포함된 초대 링크로 다시 초대하세요."
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="⛔ 비활성화가 안 될 때",
+            value=(
+                "**문제** 같은 이유로 갱신에 실패하면 \"명령어 갱신에 실패했습니다\" 안내가 뜨고 기능은 그대로 켜져 있어요. 꺼도 저장된 설정값은 남아 있고, 문의함·신고함 버튼은 눌러도 비활성화 안내만 나와요. 이미 올린 안내글은 저절로 지워지지 않아요.\n"
+                "**해결** ① 잠시 뒤 `/비활성화`를 다시 실행하세요. ② 한꺼번에 끄려면 `/모두비활성화`를 쓰세요. ③ 안내글까지 지우려면 켜 둔 상태에서 `/제거 문의함` `/제거 신고함`을 먼저 실행한 뒤 끄세요."
+            ),
             inline=False,
         )
         return embed
@@ -1536,9 +1388,6 @@ def build_guide_embed(guild_id: int, page: str) -> discord.Embed:
             value="\n".join(lines)[:1024],
             inline=False,
         )
-    warn = CATEGORY_WARN.get(page)
-    if warn:
-        embed.add_field(name="🚨 주의", value=warn, inline=False)
     return embed
 
 class GuideView(discord.ui.View):
@@ -1550,6 +1399,7 @@ class GuideView(discord.ui.View):
         for cat, (emoji, desc) in CATEGORIES.items():
             options.append(discord.SelectOption(label=cat, value=cat, emoji=emoji, description=desc[:100]))
         options.append(discord.SelectOption(label="공통 명령어", value="common", emoji="🧰", description="활성화·설정·체크·제거·초기화·역할주기"))
+        options.append(discord.SelectOption(label="주의사항", value="caution", emoji="⚠️", description="인증·제재·활성화·비활성화가 안 될 때"))
         select = discord.ui.Select(placeholder="📚 보고 싶은 항목을 선택하세요", options=options)
         select.callback = self.on_select
         self.add_item(select)
@@ -1665,6 +1515,9 @@ INQUIRY_WAIT_TEXT = "관리자가 오실때까지 시간의 여유를 즐기세�
 INQUIRY_CLOSE_DELAY = 5
 _INQUIRY_LOCKS = {}
 _CLOSING_INQUIRIES = set()
+_LAST_REMINDER = {}                       # 채널 ID -> 마지막으로 올린 '닫기' 알림 메시지 ID
+INQUIRY_REMINDER_INTERVAL = 300           # 5분
+INQUIRY_REMINDER_TITLE = "🔒 문의가 끝나셨나요?"
 
 def _inquiry_lock(guild_id: int) -> asyncio.Lock:
     return _INQUIRY_LOCKS.setdefault(guild_id, asyncio.Lock())
@@ -1795,7 +1648,11 @@ async def open_inquiry_channel(interaction: discord.Interaction):
             pass
         await interaction.followup.send(f"❌ 문의방에 안내 메시지를 보내지 못해 취소했습니다. 봇 권한을 확인해 주세요. (`{exc.status}`)", ephemeral=True)
         return
-    await interaction.followup.send(f"✅ 문의방이 열렸어요: {channel.mention}", ephemeral=True)
+    # 완료 메시지는 남기지 않습니다. ('처리 중' 표시만 조용히 지웁니다.)
+    try:
+        await interaction.delete_original_response()
+    except discord.HTTPException:
+        pass
 
 class InquiryOpenView(discord.ui.View):
     """안내글 아래의 '문의함 열기' 버튼 (봇을 재시작해도 동작하는 영구 버튼)"""
@@ -1806,6 +1663,32 @@ class InquiryOpenView(discord.ui.View):
     async def open_inquiry(self, interaction: discord.Interaction, button: discord.ui.Button):
         await open_inquiry_channel(interaction)
 
+async def _close_ticket(interaction: discord.Interaction, owner_id: int, notice: str):
+    """문의방/신고방 공통 닫기. 문의를 연 일반 유저만 닫을 수 없습니다."""
+    channel = interaction.channel
+    if not owner_id:
+        await interaction.response.send_message("❌ 문의방 또는 신고방에서만 사용할 수 있습니다.", ephemeral=True)
+        return
+    if not _can_close_inquiry(interaction, channel, owner_id):
+        await interaction.response.send_message("❌ 닫기는 관리자 또는 담당 역할을 가진 분만 할 수 있습니다.", ephemeral=True)
+        return
+    if channel.id in _CLOSING_INQUIRIES:
+        await interaction.response.send_message("⏳ 이미 닫는 중입니다.", ephemeral=True)
+        return
+    _CLOSING_INQUIRIES.add(channel.id)
+    try:
+        await interaction.response.send_message(notice)
+        await asyncio.sleep(INQUIRY_CLOSE_DELAY)
+        await channel.delete(reason=f"문의/신고 종료 (닫은 사람: {interaction.user})")
+        _LAST_REMINDER.pop(channel.id, None)
+    except discord.HTTPException:
+        try:
+            await interaction.followup.send("❌ 채널을 닫지 못했습니다. 봇의 채널 관리 권한을 확인해 주세요.", ephemeral=True)
+        except discord.HTTPException:
+            pass
+    finally:
+        _CLOSING_INQUIRIES.discard(channel.id)
+
 class InquiryCloseView(discord.ui.View):
     """문의방 안의 '문의 닫기' 버튼 (문의를 연 일반 유저를 제외한 모두가 사용 가능)"""
     def __init__(self):
@@ -1813,29 +1696,10 @@ class InquiryCloseView(discord.ui.View):
 
     @discord.ui.button(label="문의 닫기", emoji="🔒", style=discord.ButtonStyle.secondary, custom_id="natto:inquiry:close")
     async def close_inquiry(self, interaction: discord.Interaction, button: discord.ui.Button):
-        channel = interaction.channel
-        owner_id = _inquiry_owner_id(channel)
-        if not owner_id:
-            await interaction.response.send_message("❌ 문의방에서만 사용할 수 있습니다.", ephemeral=True)
-            return
-        if not _can_close_inquiry(interaction, channel, owner_id):
-            await interaction.response.send_message("❌ 문의 닫기는 관리자 또는 담당 역할을 가진 분만 할 수 있습니다.", ephemeral=True)
-            return
-        if channel.id in _CLOSING_INQUIRIES:
-            await interaction.response.send_message("⏳ 이미 문의를 닫는 중입니다.", ephemeral=True)
-            return
-        _CLOSING_INQUIRIES.add(channel.id)
-        try:
-            await interaction.response.send_message(f"🔒 낫또봇이 {INQUIRY_CLOSE_DELAY}초뒤 문의를 중단합니다....")
-            await asyncio.sleep(INQUIRY_CLOSE_DELAY)
-            await channel.delete(reason=f"문의 종료 (닫은 사람: {interaction.user})")
-        except discord.HTTPException:
-            try:
-                await interaction.followup.send("❌ 문의방을 닫지 못했습니다. 봇의 채널 관리 권한을 확인해 주세요.", ephemeral=True)
-            except discord.HTTPException:
-                pass
-        finally:
-            _CLOSING_INQUIRIES.discard(channel.id)
+        await _close_ticket(
+            interaction, _inquiry_owner_id(interaction.channel),
+            f"🔒 낫또봇이 {INQUIRY_CLOSE_DELAY}초뒤 문의를 중단합니다....",
+        )
 
 class InquiryPanelModal(discord.ui.Modal):
     """문의함 안내글(임베드)에 들어갈 내용을 입력받습니다. 제목은 고정이라 입력받지 않습니다."""
@@ -1920,15 +1784,392 @@ class InquiryChannelSelect(discord.ui.ChannelSelect):
         )
 
 # ====================================================================
+# ⏰ 문의방 '닫기' 알림 (5분마다 대화 맨 아래로 다시 올림)
+# ====================================================================
+async def _send_inquiry_reminder(channel: discord.TextChannel):
+    if discord.utils.utcnow() - channel.created_at < datetime.timedelta(seconds=INQUIRY_REMINDER_INTERVAL):
+        return  # 방금 열린 방은 첫 안내 메시지에 닫기 버튼이 이미 있습니다.
+    known = _LAST_REMINDER.get(channel.id)
+    if known is None:
+        # 봇이 재시작된 직후라면 방에 남아 있는 이전 알림을 찾아 정리합니다.
+        old = []
+        async for m in channel.history(limit=30):
+            if m.author.id == bot.user.id and m.embeds and m.embeds[0].title == INQUIRY_REMINDER_TITLE:
+                old.append(m)
+        if old and old[0].id == channel.last_message_id:
+            _LAST_REMINDER[channel.id] = old[0].id   # 이미 맨 아래에 있음
+            return
+        for m in old:
+            try:
+                await m.delete()
+            except discord.HTTPException:
+                pass
+    else:
+        if known == channel.last_message_id:
+            return                                   # 아직 맨 아래에 있으니 다시 올리지 않음
+        try:
+            await channel.get_partial_message(known).delete()
+        except discord.HTTPException:
+            pass
+    embed = discord.Embed(
+        title=INQUIRY_REMINDER_TITLE,
+        description="궁금증이 해결되었다면 아래 버튼으로 문의를 닫아 주세요.\n(닫기는 관리자와 담당 역할만 누를 수 있어요.)",
+        color=discord.Color.light_grey(),
+    )
+    message = await channel.send(embed=embed, view=InquiryCloseView())
+    _LAST_REMINDER[channel.id] = message.id
+
+async def inquiry_reminder_loop():
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        await asyncio.sleep(INQUIRY_REMINDER_INTERVAL)
+        for guild in list(bot.guilds):
+            for channel in list(guild.text_channels):
+                if not _inquiry_owner_id(channel):
+                    continue
+                try:
+                    await _send_inquiry_reminder(channel)
+                except discord.HTTPException:
+                    continue
+                except Exception as exc:
+                    print(f"문의 닫기 알림 오류: {exc}")
+
+# ====================================================================
+# 🚨 신고함 (사유 작성 → 신고 대상 선택 → 신고자 + 제재 권한자만 보는 비공개 신고방)
+# ====================================================================
+REPORT_FEATURE = "신고함"
+REPORT_PANEL_TITLE = "🚨 신고함"   # 안내글 제목은 고정입니다.
+REPORT_REASON_FIELD = "📝 신고 사유"
+REPORT_AGREE_TEXT = "동의를 하시면 신고를 당한 사용자는 제재가 들어가 서버이용이 일시적, 혹은 영구적으로 중지 될수 있습니다."
+_REPORT_STAFF_PERMS = ("administrator", "moderate_members", "ban_members", "kick_members")
+_REPORT_LOCKS = {}
+_DECIDING_REPORTS = set()
+
+def _report_lock(guild_id: int) -> asyncio.Lock:
+    return _REPORT_LOCKS.setdefault(guild_id, asyncio.Lock())
+
+def _report_info(channel):
+    """신고방 주제(topic)에서 (신고자 ID, 신고 대상 ID)를 읽습니다. 신고방이 아니면 None."""
+    match = re.search(r"report:(\d+):(\d+)", getattr(channel, "topic", None) or "")
+    return (int(match.group(1)), int(match.group(2))) if match else None
+
+def _is_report_staff(interaction: discord.Interaction) -> bool:
+    perms = interaction.permissions
+    return any(getattr(perms, name, False) for name in _REPORT_STAFF_PERMS)
+
+def _report_staff_roles(guild: discord.Guild) -> list:
+    """관리자·타임아웃·추방·차단 권한을 가진 역할(봇 연동 역할 제외)"""
+    return [
+        role for role in guild.roles
+        if not role.is_default() and not role.managed
+        and any(getattr(role.permissions, name, False) for name in _REPORT_STAFF_PERMS)
+    ]
+
+async def _delete_report_panel(guild: discord.Guild, gs: dict):
+    channel = guild.get_channel(gs.get("report_channel", 0))
+    message_id = gs.get("report_panel_message")
+    if channel and message_id:
+        try:
+            await (await channel.fetch_message(message_id)).delete()
+        except discord.HTTPException:
+            pass
+
+class ReportOpenView(discord.ui.View):
+    """안내글 아래의 '신고함 열기' 버튼 (봇을 재시작해도 동작하는 영구 버튼)"""
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="신고함 열기", emoji="🚨", style=discord.ButtonStyle.danger, custom_id="natto:report:open")
+    async def open_report(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild = interaction.guild
+        if guild is None or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("❌ 서버 안에서만 사용할 수 있습니다.", ephemeral=True)
+            return
+        if not is_on(guild.id, REPORT_FEATURE):
+            await interaction.response.send_message(INQUIRY_DISABLED_TEXT, ephemeral=True)
+            return
+        await interaction.response.send_modal(ReportReasonModal())
+
+class ReportReasonModal(discord.ui.Modal):
+    """1단계: 신고 사유 작성"""
+    def __init__(self):
+        super().__init__(title="신고 사유 작성", timeout=600)
+        self.reason_input = discord.ui.TextInput(
+            label="신고 사유", style=discord.TextStyle.paragraph, required=True, max_length=900,
+            placeholder="누가, 언제, 어떤 일을 했는지 자세히 적어주세요.",
+        )
+        self.add_item(self.reason_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        reason = self.reason_input.value.strip()
+        if not reason:
+            await interaction.response.send_message("❌ 신고 사유를 입력해 주세요.", ephemeral=True)
+            return
+        view = discord.ui.View(timeout=180)
+        view.add_item(ReportTargetSelect(reason))
+        await interaction.response.send_message(
+            "**신고할 사람**을 선택하세요. 닉네임을 검색해 고른 뒤 Enter를 누르면 신고방이 열립니다.",
+            view=view, ephemeral=True,
+        )
+
+class ReportTargetSelect(discord.ui.UserSelect):
+    """2단계: 신고할 사람 선택"""
+    def __init__(self, reason: str):
+        super().__init__(placeholder="신고할 사람의 닉네임을 선택하세요", min_values=1, max_values=1)
+        self.reason = reason
+
+    async def callback(self, interaction: discord.Interaction):
+        await create_report_room(interaction, self.values[0], self.reason)
+
+async def create_report_room(interaction: discord.Interaction, picked, reason: str):
+    guild = interaction.guild
+    reporter = interaction.user
+    if not is_on(guild.id, REPORT_FEATURE):
+        await interaction.response.edit_message(content=INQUIRY_DISABLED_TEXT, view=None)
+        return
+    target = guild.get_member(picked.id)
+    if target is None:
+        await interaction.response.send_message("❌ 서버에서 찾을 수 없는 사용자입니다. 다른 사람을 선택해 주세요.", ephemeral=True)
+        return
+    if target.id == reporter.id:
+        await interaction.response.send_message("❌ 자기 자신은 신고할 수 없습니다.", ephemeral=True)
+        return
+    if target.bot:
+        await interaction.response.send_message("❌ 봇은 신고할 수 없습니다.", ephemeral=True)
+        return
+
+    await interaction.response.defer()
+    me = guild.me
+    async with _report_lock(guild.id):
+        gs = get_gs(guild.id)
+        for existing in guild.text_channels:
+            if _report_info(existing) == (reporter.id, target.id):
+                await interaction.edit_original_response(content=f"📨 이미 열려 있는 신고방이 있어요: {existing.mention}", view=None)
+                return
+        panel_channel = guild.get_channel(gs.get("report_channel", 0))
+        category = panel_channel.category if panel_channel else None
+        number = int(gs.get("report_count", 0)) + 1
+
+        # 신고자 + 제재 권한을 가진 역할 + 봇만 보이게 하고, 신고 대상은 어떤 경우에도 숨깁니다.
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            reporter: _grantable(me.guild_permissions, *_VIEWER_PERMS),
+            me: _grantable(me.guild_permissions, "view_channel", "send_messages", "read_message_history",
+                           "embed_links", "manage_channels", "mention_everyone"),
+        }
+        for role in _report_staff_roles(guild):
+            overwrites[role] = _grantable(me.guild_permissions, *_VIEWER_PERMS)
+        overwrites[target] = discord.PermissionOverwrite(view_channel=False)
+
+        try:
+            channel = await guild.create_text_channel(
+                name=f"신고함-{number}",
+                category=category,
+                overwrites=overwrites,
+                topic=f"신고방 | report:{reporter.id}:{target.id}",
+                reason=f"신고함: {reporter} 님이 신고방을 열었습니다.",
+            )
+        except discord.Forbidden:
+            await interaction.edit_original_response(content="❌ 봇에게 채널 관리 권한이 없어 신고방을 만들 수 없습니다. 관리자에게 알려주세요.", view=None)
+            return
+        except discord.HTTPException as exc:
+            await interaction.edit_original_response(content=f"❌ 신고방을 만들지 못했습니다. 잠시 후 다시 시도해 주세요. (`{exc.status}`)", view=None)
+            return
+        gs["report_count"] = number
+        save_settings(GUILD_SETTINGS)
+
+    if panel_channel:
+        try:
+            await channel.move(after=panel_channel, reason="신고함 안내글 채널 바로 아래로 배치")
+        except (discord.HTTPException, ValueError, TypeError) as exc:
+            print(f"신고방 위치 이동 실패: {exc}")
+
+    embed = discord.Embed(title="🚨 신고가 접수되었습니다", color=discord.Color.red(), timestamp=discord.utils.utcnow())
+    embed.add_field(name="👤 신고자", value=reporter.mention, inline=True)
+    embed.add_field(name="🎯 신고 대상", value=target.mention, inline=True)
+    embed.add_field(name=REPORT_REASON_FIELD, value=reason, inline=False)
+    embed.add_field(name="⚠️ 동의 안내", value=REPORT_AGREE_TEXT, inline=False)
+    embed.set_footer(text="이 방은 신고자와 제재 권한을 가진 관리자만 볼 수 있어요.")
+    try:
+        await channel.send(
+            content="@everyone",
+            embed=embed,
+            view=ReportDecisionView(),
+            allowed_mentions=discord.AllowedMentions(everyone=True, users=False, roles=False),
+        )
+    except discord.HTTPException as exc:
+        try:
+            await channel.delete(reason="신고방 안내 메시지 전송 실패로 정리")
+        except discord.HTTPException:
+            pass
+        await interaction.edit_original_response(content=f"❌ 신고방에 안내 메시지를 보내지 못해 취소했습니다. 봇 권한을 확인해 주세요. (`{exc.status}`)", view=None)
+        return
+    await interaction.edit_original_response(content=f"✅ 신고방이 열렸어요: {channel.mention}", view=None)
+
+async def _report_decide(interaction: discord.Interaction, agree: bool):
+    guild = interaction.guild
+    channel = interaction.channel
+    message = interaction.message
+    info = _report_info(channel)
+    if guild is None or info is None or message is None:
+        await interaction.response.send_message("❌ 신고방에서만 사용할 수 있습니다.", ephemeral=True)
+        return
+    reporter_id, target_id = info
+    staff = _is_report_staff(interaction)
+    if agree and not staff:
+        await interaction.response.send_message("❌ 동의는 제재 권한(관리자·타임아웃·추방·차단)을 가진 분만 누를 수 있습니다.", ephemeral=True)
+        return
+    if not agree and not (staff or interaction.user.id == reporter_id):
+        await interaction.response.send_message("❌ 거절은 신고자 본인 또는 제재 권한을 가진 분만 누를 수 있습니다.", ephemeral=True)
+        return
+    if message.id in _DECIDING_REPORTS:
+        await interaction.response.send_message("⏳ 이미 처리 중입니다.", ephemeral=True)
+        return
+
+    embed0 = message.embeds[0] if message.embeds else None
+    reason = next((f.value for f in (embed0.fields if embed0 else []) if f.name == REPORT_REASON_FIELD), "신고함으로 접수된 신고")
+
+    if agree:
+        # 제재 기능과 제재로그가 준비되어 있어야 기존 제재 기능으로 처리할 수 있습니다.
+        problems = []
+        if not is_on(guild.id, "제재"):
+            problems.append("• **제재 기능**이 켜져 있지 않아요. `/활성화`에서 **제재**를 켜 주세요.")
+        log_id = GUILD_SETTINGS.get(guild.id, {}).get("punish_log_channel")
+        if not log_id or guild.get_channel(log_id) is None:
+            problems.append("• **제재로그 채널**이 설정되어 있지 않아요. " + setup_hint(guild.id, "제재로그"))
+        if problems:
+            await interaction.response.send_message(
+                "⚠️ 제재를 적용하려면 먼저 설정이 필요해요.\n" + "\n".join(problems) + "\n설정을 마친 뒤 다시 **동의**를 눌러 주세요.",
+                ephemeral=True,
+            )
+            return
+
+    _DECIDING_REPORTS.add(message.id)
+    try:
+        await interaction.response.defer()
+        done = discord.Embed(timestamp=discord.utils.utcnow())
+        finished = True
+        if agree:
+            target = guild.get_member(target_id)
+            if target is None:
+                done.title = "⚠️ 제재를 적용하지 못했습니다"
+                done.description = f"<@{target_id}>님이 이미 서버에 없어 제재를 적용할 수 없습니다.\n처리자: {interaction.user.mention}"
+                done.color = discord.Color.orange()
+            else:
+                # 제재 사유는 신고함에 적힌 내용 그대로 사용하고, 기존 /제재와 같은 제재 로직을 씁니다.
+                ok = await punish_user(guild, target, reason, f"신고함 승인 ({interaction.user.name})")
+                if ok:
+                    done.title = "✅ 신고가 승인되었습니다"
+                    done.description = f"{target.mention}님에게 제재가 적용되었습니다.\n처리자: {interaction.user.mention}"
+                    done.add_field(name="제재 사유", value=reason[:1024], inline=False)
+                    done.color = discord.Color.green()
+                else:
+                    finished = False
+                    done.title = "❌ 제재 적용에 실패했습니다"
+                    done.description = "봇의 역할 순위·권한을 확인한 뒤 다시 **동의**를 눌러 주세요. (자세한 내용은 제재로그에 남습니다)"
+                    done.color = discord.Color.dark_red()
+        else:
+            done.title = "❌ 신고가 거절되었습니다"
+            if staff:
+                done.description = f"<@{reporter_id}>님의 신고가 거절되어 제재 없이 종료되었습니다.\n처리자: {interaction.user.mention}"
+            else:
+                done.description = f"<@{reporter_id}>님이 직접 신고를 거절(철회)해 제재 없이 종료되었습니다."
+            done.color = discord.Color.red()
+
+        if finished:
+            disabled = ReportDecisionView()
+            for child in disabled.children:
+                child.disabled = True
+            try:
+                await interaction.edit_original_response(view=disabled)
+            except discord.HTTPException:
+                pass
+        await channel.send(embed=done, view=ReportCloseView() if finished else None,
+                           allowed_mentions=discord.AllowedMentions.none())
+    finally:
+        _DECIDING_REPORTS.discard(message.id)
+
+class ReportDecisionView(discord.ui.View):
+    """신고방의 동의/거절 버튼"""
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="동의", emoji="✅", style=discord.ButtonStyle.success, custom_id="natto:report:agree")
+    async def agree(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _report_decide(interaction, True)
+
+    @discord.ui.button(label="거절", emoji="❌", style=discord.ButtonStyle.danger, custom_id="natto:report:reject")
+    async def reject(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _report_decide(interaction, False)
+
+class ReportCloseView(discord.ui.View):
+    """처리가 끝난 신고방의 '신고방 닫기' 버튼"""
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="신고방 닫기", emoji="🔒", style=discord.ButtonStyle.secondary, custom_id="natto:report:close")
+    async def close_report(self, interaction: discord.Interaction, button: discord.ui.Button):
+        info = _report_info(interaction.channel)
+        await _close_ticket(
+            interaction, info[0] if info else 0,
+            f"🔒 낫또봇이 {INQUIRY_CLOSE_DELAY}초뒤 신고방을 닫습니다....",
+        )
+
+class ReportPanelModal(discord.ui.Modal):
+    """신고함 안내글(임베드)에 들어갈 내용을 입력받습니다. 제목은 고정입니다."""
+    def __init__(self, channel_id: int):
+        super().__init__(title="신고함 안내글 작성", timeout=900)
+        self.channel_id = channel_id
+        self.body_input = discord.ui.TextInput(
+            label="안내 내용", style=discord.TextStyle.paragraph, required=True, max_length=3000,
+            placeholder="신고 전에 알아야 할 내용을 적어주세요. 줄바꿈은 그대로 입력하면 됩니다.",
+        )
+        self.add_item(self.body_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        guild = interaction.guild
+        channel = guild.get_channel(self.channel_id)
+        if channel is None:
+            await interaction.response.send_message("❌ 선택한 채널을 찾을 수 없습니다. 다시 `/설정 신고함`을 실행해 주세요.", ephemeral=True)
+            return
+        embed = discord.Embed(title=REPORT_PANEL_TITLE, description=self.body_input.value.strip(), color=discord.Color.red())
+        embed.set_footer(text="아래 버튼을 눌러 신고함을 열어 주세요.")
+        await interaction.response.defer(ephemeral=True)
+        gs = get_gs(guild.id)
+        try:
+            message = await channel.send(embed=embed, view=ReportOpenView())
+        except discord.Forbidden:
+            await interaction.followup.send(f"❌ {channel.mention} 채널에 메시지를 보낼 권한이 없습니다. 봇 권한(메시지 보내기·링크 임베드)을 확인해 주세요.", ephemeral=True)
+            return
+        except discord.HTTPException as exc:
+            await interaction.followup.send(f"❌ 안내글을 올리지 못했습니다. 잠시 후 다시 시도해 주세요. (`{exc.status}`)", ephemeral=True)
+            return
+        await _delete_report_panel(guild, gs)
+        gs["report_channel"] = channel.id
+        gs["report_panel_message"] = message.id
+        save_settings(GUILD_SETTINGS)
+        done = discord.Embed(
+            title="✅ 신고함 설정 완료",
+            description=f"{channel.mention} 에 안내글과 **신고함 열기** 버튼을 올렸습니다.\n[안내글 바로가기]({message.jump_url})",
+            color=discord.Color.green(),
+        )
+        await interaction.followup.send(embed=done, ephemeral=True)
+
+class ReportChannelSelect(discord.ui.ChannelSelect):
+    def __init__(self):
+        super().__init__(placeholder="신고함 안내글을 올릴 채널을 선택하세요", channel_types=[discord.ChannelType.text], min_values=1, max_values=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(ReportPanelModal(self.values[0].id))
+
+# ====================================================================
 # 📚 기능 카탈로그 (카테고리 · 명령어 매핑)
 # ====================================================================
 CATEGORIES = {
     "인증": ("🪪", "신입 유저 인증과 역할 지급"),
     "제재": ("🚨", "제재·검열·추방 관리"),
     "입퇴장": ("🚪", "유저 입장·퇴장 로그"),
-    "청소": ("🧹", "채널·서버를 새로 만들어 깔끔하게 청소"),
-    "문의": ("📨", "버튼으로 여는 1:1 비공개 문의방"),
-    "기타": ("📖", "번역과 사용법 안내"),
+    "기타": ("📖", "번역·가이드·청소·문의함·신고함"),
 }
 
 FEATURES = {
@@ -1949,7 +2190,7 @@ FEATURES = {
     },
     "인증메세지": {
         "cat": "인증", "label": "인증 안내 메세지", "store": "auth_form",
-        "desc": "신입 입장 시 인증방에 보낼 안내 문구를 등록합니다.", "usage": "`메세지`",
+        "desc": "신입 입장 시 인증방에 보낼 안내 문구를 등록합니다. `@들어온사용자` `@자기자신` `(@닉네임)` 으로 멘션할 수 있어요.", "usage": "`메세지`",
         "set": set_auth_form_cb, "check": check_auth_form_cb,
     },
     "인증완료": {
@@ -2015,21 +2256,25 @@ FEATURES = {
     },
     # ---------- 청소 ----------
     "청소": {
-        "cat": "청소", "desc": "현재 채널을 같은 설정으로 새로 만들어 메시지를 비웁니다. 고정 메시지·포스트는 복원됩니다.", "usage": "",
+        "cat": "기타", "desc": "현재 채널을 같은 설정으로 새로 만들어 메시지를 비웁니다. 고정 메시지·포스트는 복원됩니다.", "usage": "",
         "top": clean_channel_cb,
-    },
-    "서버청소": {
-        "cat": "청소", "desc": "서버의 모든 채널·카테고리를 같은 설정으로 새로 만들어 메시지를 비웁니다. 고정 메시지는 복원됩니다.", "usage": "",
-        "top": clean_server_cb,
     },
     # ---------- 문의 ----------
     "문의함": {
-        "cat": "문의", "label": "문의함 채널", "store": "inquiry_channel",
+        "cat": "기타", "label": "문의함 채널", "store": "inquiry_channel",
         "desc": "문의함 열기 버튼이 달린 안내글을 올립니다. 누르면 문의자·관리자·지정 역할만 보는 비공개 문의방이 열려요.",
         "usage": "`채널` → `열람 역할` → `안내 내용`",
         "set": make_set_channel("inquiry_channel", "문의함 채널"),
         "remove": make_remove_channel("inquiry_channel", "문의함 채널"),
         "check": make_check_channel("inquiry_channel", "문의함 채널"),
+    },
+    "신고함": {
+        "cat": "기타", "label": "신고함 채널", "store": "report_channel",
+        "desc": "신고함 열기 버튼이 달린 안내글을 올립니다. 신고하면 신고자와 제재 권한을 가진 관리자만 보는 비공개 신고방이 열려요.",
+        "usage": "`채널` → `안내 내용`",
+        "set": make_set_channel("report_channel", "신고함 채널"),
+        "remove": make_remove_channel("report_channel", "신고함 채널"),
+        "check": make_check_channel("report_channel", "신고함 채널"),
     },
     # ---------- 기타 ----------
     "번역": {
@@ -2178,7 +2423,7 @@ class SettingTextModal(discord.ui.Modal):
         if feature_key == "인증메세지":
             title = "인증 안내 문구 설정"
             label = "인증방에 표시할 문구"
-            placeholder = "줄바꿈은 그대로 입력할 수 있습니다."
+            placeholder = "@들어온사용자 · @자기자신 · (@닉네임) 으로 멘션할 수 있어요"
             max_length = 4000
         else:
             title = f"{feature_key} 설정"
@@ -2227,6 +2472,10 @@ async def generic_set_cb(interaction: discord.Interaction, 기능: str):
         view = discord.ui.View(timeout=180)
         view.add_item(SettingChannelSelect(기능))
         await interaction.response.send_message(f"**{기능}** 설정: 아래에서 채널을 선택하세요.", view=view, ephemeral=True)
+    elif 기능 == "신고함":
+        view = discord.ui.View(timeout=180)
+        view.add_item(ReportChannelSelect())
+        await interaction.response.send_message("**신고함** 설정: 안내글과 **신고함 열기** 버튼을 올릴 채널을 선택하세요.", view=view, ephemeral=True)
     elif 기능 == "문의함":
         view = discord.ui.View(timeout=180)
         view.add_item(InquiryChannelSelect())
@@ -2240,7 +2489,7 @@ async def generic_set_cb(interaction: discord.Interaction, 기능: str):
     else:
         await interaction.response.send_message("❌ 이 항목은 설정 UI를 지원하지 않습니다.", ephemeral=True)
 
-CHANNEL_SETTING_FEATURES = ("인증방", "제재로그", "입장로그", "퇴장로그", "문의함")
+CHANNEL_SETTING_FEATURES = ("인증방", "제재로그", "입장로그", "퇴장로그", "문의함", "신고함")
 
 def _check_embed(기능: str, description: str, ok: bool) -> discord.Embed:
     return discord.Embed(
@@ -2267,14 +2516,15 @@ async def generic_check_cb(interaction: discord.Interaction, 기능: str):
         channel = guild.get_channel(channel_id) if channel_id else None
         if channel:
             embed = _check_embed(기능, channel.mention, True)  # #채널명 링크로 표시됩니다.
-            if 기능 == "문의함":
-                message_id = gs.get("inquiry_panel_message")
+            if 기능 in ("문의함", "신고함"):
+                message_id = gs.get("inquiry_panel_message" if 기능 == "문의함" else "report_panel_message")
                 if message_id:
                     embed.add_field(
                         name="안내글",
                         value=f"[바로가기](https://discord.com/channels/{guild.id}/{channel.id}/{message_id})",
                         inline=False,
                     )
+            if 기능 == "문의함":
                 viewers = [r for r in (guild.get_role(x) for x in gs.get("inquiry_roles", [])) if r]
                 embed.add_field(
                     name="문의방을 볼 수 있는 역할",
@@ -2291,6 +2541,9 @@ async def generic_check_cb(interaction: discord.Interaction, 기능: str):
     elif 기능 == "인증메세지":
         form = str(gs.get("auth_form", "")).replace("\\n", "\n").strip()
         embed = _check_embed(기능, form if form else "❌ 설정된 인증 안내 메세지가 없습니다.", bool(form))
+        if form:
+            preview = render_placeholders(form, guild, joined=interaction.user, me=interaction.user)
+            embed.add_field(name="미리보기 (나를 들어온 사용자로 가정)", value=preview[:1024], inline=False)
     elif 기능 in ("제재단어", "검열단어"):
         words = [str(w) for w in gs.get("ban_words" if 기능 == "제재단어" else "censor_words", []) if str(w).strip()]
         embed = _check_embed(기능, " ".join(f"`{w}`" for w in words) if words else f"❌ 등록된 {기능}가 없습니다.", bool(words))
@@ -2319,6 +2572,10 @@ async def generic_remove_cb(interaction: discord.Interaction, 기능: str, 값: 
         await _delete_inquiry_panel(interaction.guild, gs)
         gs.pop("inquiry_channel", None); gs.pop("inquiry_panel_message", None); gs.pop("inquiry_roles", None)
         result = "🗑️ 문의함에 대한 안내글 등의 데이터를 제거합니다."
+    elif 기능 == "신고함" and gs.get("report_channel"):
+        await _delete_report_panel(interaction.guild, gs)
+        gs.pop("report_channel", None); gs.pop("report_panel_message", None)
+        result = "🗑️ 신고함에 대한 안내글 등의 데이터를 제거합니다."
     elif store and store in gs: del gs[store]; result = f"🗑️ {기능} 설정을 제거했습니다."
     else:
         await interaction.response.send_message("❌ 제거할 설정이 없습니다.", ephemeral=True); return
@@ -2519,6 +2776,75 @@ async def deactivate_all_cb(interaction: discord.Interaction):
 
 def build_deactivate_all_command() -> app_commands.Command:
     return _with_default_permissions(app_commands.Command(name="모두비활성화", description="모든 기능을 한 번에 비활성화합니다.", callback=deactivate_all_cb), discord.Permissions(administrator=True))
+
+# ================= [ 안내 문구 멘션 치환 ] =================
+_NICK_MENTION_RE = re.compile(r"\(@([^()\n@]{1,64})\)")
+
+def _find_member_by_name(guild: discord.Guild, name: str):
+    """서버 닉네임·본 닉네임(표시 이름/계정 이름)이 정확히 같은 멤버를 찾습니다. (대소문자 무시)"""
+    wanted = name.strip().casefold()
+    if not wanted:
+        return None
+    for m in guild.members:
+        if wanted in (m.display_name.casefold(), m.name.casefold(), (m.global_name or "").casefold()):
+            return m
+    return None
+
+def render_placeholders(text: str, guild: discord.Guild, joined=None, me=None) -> str:
+    """안내 문구 속 멘션 자리표시자를 실제 멘션으로 바꿉니다.
+    @들어온사용자 → 들어온 사용자 / @자기자신 → 자기 자신 / (@닉네임) → 해당 닉네임의 사용자"""
+    if joined is not None:
+        text = text.replace("@들어온사용자", joined.mention)
+    if me is not None:
+        text = text.replace("@자기자신", me.mention)
+
+    def _replace(match):
+        member = _find_member_by_name(guild, match.group(1))
+        return member.mention if member else match.group(0)
+    return _NICK_MENTION_RE.sub(_replace, text)
+
+# ================= [ 입장 / 퇴장 ] =================
+@bot.event
+async def on_member_join(member: discord.Member):
+    guild = member.guild
+    gs = GUILD_SETTINGS.get(guild.id, {})
+
+    # 인증 안내 메세지 (자리표시자 치환)
+    if not member.bot and is_on(guild.id, "인증방") and is_on(guild.id, "인증메세지"):
+        channel = guild.get_channel(gs.get("auth_channel", 0))
+        form = str(gs.get("auth_form", "")).replace("\\n", "\n").strip()
+        if channel and form:
+            text = render_placeholders(form, guild, joined=member, me=member)
+            try:
+                await channel.send(text[:2000], allowed_mentions=discord.AllowedMentions(users=True, roles=True, everyone=False))
+            except discord.HTTPException as exc:
+                print(f"인증 안내 메세지 전송 실패: {exc}")
+
+    # 입장 로그
+    if is_on(guild.id, "입장로그"):
+        log_channel = guild.get_channel(gs.get("join_log_channel", 0))
+        if log_channel:
+            embed = discord.Embed(title="📥 유저 입장", description=f"{member.mention} ({safe_text(member.name)})", color=discord.Color.green(), timestamp=discord.utils.utcnow())
+            embed.add_field(name="계정 생성", value=discord.utils.format_dt(member.created_at, "R"), inline=True)
+            embed.set_thumbnail(url=member.display_avatar.url)
+            try:
+                await log_channel.send(embed=embed)
+            except discord.HTTPException as exc:
+                print(f"입장 로그 전송 실패: {exc}")
+
+@bot.event
+async def on_member_remove(member: discord.Member):
+    guild = member.guild
+    if not is_on(guild.id, "퇴장로그"):
+        return
+    log_channel = guild.get_channel(GUILD_SETTINGS.get(guild.id, {}).get("leave_log_channel", 0))
+    if log_channel:
+        embed = discord.Embed(title="📤 유저 퇴장", description=f"{member.mention} ({safe_text(member.name)})", color=discord.Color.dark_grey(), timestamp=discord.utils.utcnow())
+        embed.set_thumbnail(url=member.display_avatar.url)
+        try:
+            await log_channel.send(embed=embed)
+        except discord.HTTPException as exc:
+            print(f"퇴장 로그 전송 실패: {exc}")
 
 # ================= [ 실시간 제재/검열 단어 처리 ] =================
 @bot.event
