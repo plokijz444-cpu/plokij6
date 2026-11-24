@@ -486,11 +486,11 @@ async def approve_user_cb(interaction: discord.Interaction, 유저: discord.Memb
                 color=discord.Color.green(),
                 timestamp=discord.utils.utcnow(),
             )
-            done_embed.add_field(name="인증된 유저", value=safe_text(유저.display_name), inline=False)
+            done_embed.set_thumbnail(url=유저.display_avatar.url)
+            done_embed.add_field(name="인증된 유저", value=유저.mention, inline=False)
             done_embed.add_field(name="부여받은 역할", value="\n".join(role.mention for role in roles_to_add), inline=False)
             await target_channel.send(embed=done_embed)
-            await target_channel.send(유저.mention, allowed_mentions=discord.AllowedMentions(users=True))
-        await interaction.followup.send(f"✅ {safe_text(유저.name)}님에게 성공적으로 {len(roles_to_add)}개의 역할을 지급하고 승인했습니다.", delete_after=5)
+        await interaction.followup.send(f"✅ 인증이 완료되었습니다. 역할 {len(roles_to_add)}개를 지급했습니다.", delete_after=5)
     except discord.Forbidden:
         await interaction.followup.send("❌ 봇의 서열(역할 순위)이 타겟 유저 또는 지급 역할보다 낮아 처리에 실패했습니다.", delete_after=5)
 
@@ -1375,7 +1375,7 @@ def build_guide_embed(guild_id: int, page: str) -> discord.Embed:
                 "`/체크 [기능]` — 현재 저장된 설정을 확인합니다.\n"
                 "`/제거 [기능] [값]` — 설정을 지웁니다. 단어 기능은 `값`에 단어를 적으면 그 단어만, 비우면 전체를 지우고, `인증지급`은 등록된 역할 전체를 비웁니다.\n"
                 "`/초기화 [기능]` — `인증지급`·`제재단어`·`검열단어` 목록을 모두 비웁니다. 확인창에서 ✅ 를 눌러야 실행되고 ❌ 는 취소예요.\n"
-                "`/설정 소리함` — 소리함 제목을 정하고 안내 채널, 티켓 내용 열람 역할, 문의·신고·상담 기능을 설정합니다."
+                "`/설정 소리함` — 소리함 제목, 안내 채널, 티켓에서 도움을 줄 역할, 문의·신고·상담·기타 종류를 선택하고 마지막에 안내 내용을 작성합니다."
             ),
             inline=False,
         )
@@ -1701,7 +1701,7 @@ class InquiryOpenView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="문의함 열기", emoji="📨", style=discord.ButtonStyle.primary, custom_id="natto:inquiry:open")
+    @discord.ui.button(label="문의함 열기", emoji="📨", style=discord.ButtonStyle.secondary, custom_id="natto:inquiry:open")
     async def open_inquiry(self, interaction: discord.Interaction, button: discord.ui.Button):
         await open_inquiry_channel(interaction)
 
@@ -1793,13 +1793,13 @@ class InquiryPanelModal(discord.ui.Modal):
             ),
             color=discord.Color.green(),
         )
-        done.add_field(name="티켓 내용을 볼 수 있는 역할", value=f"{roles_text}\n(서버 관리자는 항상 볼 수 있어요)", inline=False)
+        done.add_field(name="티켓에서 도움을 줄 사람", value=f"{roles_text}\n(서버 관리자는 항상 볼 수 있어요)", inline=False)
         await interaction.followup.send(embed=done, ephemeral=True)
 
 class InquiryRoleSelect(discord.ui.RoleSelect):
-    """2단계: 티켓 내용을 볼 수 있는 역할 선택"""
+    """2단계: 티켓에서 도움을 줄 사람 선택"""
     def __init__(self, channel_id: int):
-        super().__init__(placeholder="티켓 내용을 볼 수 있는 역할을 선택하세요 (최대 5개)", min_values=1, max_values=5)
+        super().__init__(placeholder="티켓에서 도움을 줄 사람을 선택하세요 (최대 5개)", min_values=1, max_values=5)
         self.channel_id = channel_id
 
     async def callback(self, interaction: discord.Interaction):
@@ -1924,7 +1924,7 @@ class ReportOpenView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="신고함 열기", emoji="🚨", style=discord.ButtonStyle.primary, custom_id="natto:report:open")
+    @discord.ui.button(label="신고함 열기", emoji="🚨", style=discord.ButtonStyle.secondary, custom_id="natto:report:open")
     async def open_report(self, interaction: discord.Interaction, button: discord.ui.Button):
         guild = interaction.guild
         if guild is None or not isinstance(interaction.user, discord.Member):
@@ -2148,11 +2148,11 @@ class ReportDecisionView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="동의", emoji="✅", style=discord.ButtonStyle.primary, custom_id="natto:report:agree")
+    @discord.ui.button(label="동의", emoji="✅", style=discord.ButtonStyle.secondary, custom_id="natto:report:agree")
     async def agree(self, interaction: discord.Interaction, button: discord.ui.Button):
         await _report_decide(interaction, True)
 
-    @discord.ui.button(label="거절", emoji="❌", style=discord.ButtonStyle.primary, custom_id="natto:report:reject")
+    @discord.ui.button(label="거절", emoji="❌", style=discord.ButtonStyle.secondary, custom_id="natto:report:reject")
     async def reject(self, interaction: discord.Interaction, button: discord.ui.Button):
         await _report_decide(interaction, False)
 
@@ -2225,7 +2225,7 @@ class ReportChannelSelect(discord.ui.ChannelSelect):
 SORIHAM_FEATURE = "소리함"
 
 def _ticket_meta(channel):
-    match = re.search(r"soriham:(\d+):(문의|신고|상담):(\d+)", getattr(channel, "topic", None) or "")
+    match = re.search(r"soriham:(\d+):(문의|신고|상담|기타):(\d+)", getattr(channel, "topic", None) or "")
     return (int(match.group(1)), match.group(2), int(match.group(3))) if match else None
 
 def _ticket_slug(value: str) -> str:
@@ -2277,14 +2277,16 @@ async def _create_soriham_ticket(interaction: discord.Interaction, kind: str, re
         pass
     opened_at = discord.utils.utcnow()
     embed = discord.Embed(
-        title="관리자가 오실때까지 커피 한잔의 여유를 즐기세요..☕☕",
-        description=f"{owner.mention}님의 티켓이 열렸습니다. 담당자가 확인할 때까지 잠시 기다려 주세요.",
+        title="커피 한잔의 여유를 즐기며 기다려주세요..☕☕",
+        description=f"{owner.mention}님의 티켓이 열렸습니다.",
         color=discord.Color.blurple(),
         timestamp=opened_at,
     )
+    embed.set_thumbnail(url=owner.display_avatar.url)
     embed.add_field(name="티켓 개설 시간", value=format_kst(opened_at), inline=True)
-    embed.add_field(name="요청한 유저", value=f"{owner.mention} ({safe_text(owner.display_name)})", inline=True)
-    embed.add_field(name="문의 종류", value=kind, inline=True)
+    embed.add_field(name="요청한 유저", value=owner.mention, inline=True)
+    embed.add_field(name="요청을 받은 유저", value="@everyone", inline=True)
+    embed.add_field(name=f"{title}종류", value=kind, inline=True)
     embed.add_field(name="티켓 번호", value=f"{number:04d}" if number < 10000 else str(number), inline=True)
     if kind == "신고":
         target_preview = targets if len(targets) <= 1000 else "신고 대상 전체 목록은 아래 추가 메시지에 표시됩니다."
@@ -2293,11 +2295,12 @@ async def _create_soriham_ticket(interaction: discord.Interaction, kind: str, re
         embed.add_field(name="안내", value="관련 자료와 추가 설명을 이 티켓에 작성해 주세요. 신고 대상자는 티켓 내용을 볼 수 없습니다.", inline=False)
     elif kind == "문의":
         embed.add_field(name="안내", value="문의 내용을 이 티켓에 작성해 주세요. 담당자가 확인 후 답변합니다.", inline=False)
-    else:
+    elif kind == "상담":
         embed.add_field(name="안내", value="상담할 내용을 편하게 작성해 주세요.", inline=False)
-    embed.set_footer(text="티켓을 닫을 수 있는 것은 서버 관리자뿐입니다. 일반 사용자는 관리자에게 닫기를 요청할 수 있습니다.")
+    else:
+        embed.add_field(name="안내", value="기타 내용을 이 티켓에서 자유롭게 작성해 주세요.", inline=False)
     try:
-        await channel.send(content="@everyone", embed=embed, view=SoriHamTicketView(), allowed_mentions=discord.AllowedMentions(everyone=True, users=False, roles=False))
+        await channel.send(embed=embed, view=SoriHamTicketView())
         if kind == "신고" and len(targets) > 1000:
             current = ""
             for item in targets.split(", "):
@@ -2334,7 +2337,7 @@ class SoriHamReportModal(discord.ui.Modal):
 
 class SoriHamCategorySelect(discord.ui.Select):
     def __init__(self, enabled):
-        opts = [discord.SelectOption(label=k, value=k, emoji={"문의":"💬","신고":"🚨","상담":"🗨️"}[k]) for k in ("문의","신고","상담") if k in enabled]
+        opts = [discord.SelectOption(label=k, value=k, emoji={"문의":"💬","신고":"🚨","상담":"🗨️","기타":"📌"}[k]) for k in ("문의","신고","상담","기타") if k in enabled]
         super().__init__(placeholder="열고 싶은 티켓 종류를 선택하세요", min_values=1, max_values=1, options=opts)
     async def callback(self, interaction):
         kind = self.values[0]
@@ -2360,24 +2363,24 @@ class SoriHamPanelView(discord.ui.View):
 
 class SoriHamTicketView(discord.ui.View):
     def __init__(self): super().__init__(timeout=None)
-    @discord.ui.button(label="티켓 닫기 (관리자 전용)", emoji="🔒", style=discord.ButtonStyle.secondary, custom_id="natto:soriham:close")
+    @discord.ui.button(label="티켓 닫기", emoji="🔒", style=discord.ButtonStyle.secondary, custom_id="natto:soriham:close")
     async def close_ticket(self, interaction, button):
         meta = _ticket_meta(interaction.channel)
         if not meta:
             await interaction.response.send_message("소리함 티켓에서만 사용할 수 있습니다.", ephemeral=True, delete_after=5); return
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("티켓은 서버 관리자만 닫을 수 있습니다. 옆의 **관리자에게 닫기 요청** 버튼을 이용해 주세요.", ephemeral=True, delete_after=5); return
-        await interaction.response.send_message("🔒 관리자가 티켓을 닫았습니다. 5초 후 채널이 삭제됩니다.", ephemeral=True, delete_after=5)
+        bot_member = interaction.guild.me
+        can_close = interaction.user.id == interaction.guild.owner_id or (bot_member and interaction.user.top_role > bot_member.top_role)
+        if not can_close:
+            await interaction.response.send_message("나또봇보다 높은 역할을 가진 사용자만 티켓을 닫을 수 있습니다.", ephemeral=True, delete_after=5); return
+        await interaction.response.send_message("🔒 티켓을 닫았습니다. 5초 후 채널이 삭제됩니다.", ephemeral=True, delete_after=5)
         await asyncio.sleep(5)
-        try: await interaction.channel.delete(reason=f"관리자 {interaction.user}가 소리함 티켓을 닫음")
+        try: await interaction.channel.delete(reason=f"{interaction.user}가 소리함 티켓을 닫음")
         except discord.HTTPException: pass
-    @discord.ui.button(label="관리자에게 닫기 요청", emoji="📩", style=discord.ButtonStyle.secondary, custom_id="natto:soriham:request_close")
+    @discord.ui.button(label="닫기요청", emoji="📩", style=discord.ButtonStyle.secondary, custom_id="natto:soriham:request_close")
     async def request_close(self, interaction, button):
         meta = _ticket_meta(interaction.channel)
         if not meta:
             await interaction.response.send_message("소리함 티켓에서만 사용할 수 있습니다.", ephemeral=True, delete_after=5); return
-        if interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("관리자는 위의 티켓 닫기 버튼을 이용해 주세요.", ephemeral=True, delete_after=5); return
         user = interaction.user
         created = format_kst(user.created_at)
         top_role = user.top_role.mention if not user.top_role.is_default() else "별도 역할 없음"
@@ -2387,7 +2390,8 @@ class SoriHamTicketView(discord.ui.View):
             color=discord.Color.orange(),
             timestamp=discord.utils.utcnow(),
         )
-        request_embed.add_field(name="요청한 사람", value=f"{user.mention} ({safe_text(user.display_name)})", inline=False)
+        request_embed.add_field(name="요청한 유저", value=user.mention, inline=False)
+        request_embed.add_field(name="요청을 받은 유저", value="@everyone", inline=False)
         request_embed.add_field(name="요청자의 가장 높은 역할", value=top_role, inline=False)
         request_embed.add_field(name="요청이 들어온 방", value=channel_link, inline=False)
         request_embed.add_field(name="티켓 종류", value=meta[1], inline=True)
@@ -2423,27 +2427,27 @@ class _SoriHamRoleSelect(discord.ui.RoleSelect):
 class _SoriHamFeatureSelect(discord.ui.Select):
     def __init__(self, parent):
         self.parent = parent
-        options = [discord.SelectOption(label="문의", value="문의", emoji="💬"), discord.SelectOption(label="신고", value="신고", emoji="🚨"), discord.SelectOption(label="상담", value="상담", emoji="🗨️")]
-        super().__init__(placeholder="활성화할 기능을 모두 선택하세요", min_values=1, max_values=3, options=options, row=2)
+        options = [discord.SelectOption(label="문의", value="문의", emoji="💬"), discord.SelectOption(label="신고", value="신고", emoji="🚨"), discord.SelectOption(label="상담", value="상담", emoji="🗨️"), discord.SelectOption(label="기타", value="기타", emoji="📌")]
+        super().__init__(placeholder="활성화할 기능을 모두 선택하세요", min_values=1, max_values=4, options=options, row=2)
     async def callback(self, interaction):
         self.parent.features = list(self.values)
         await interaction.response.defer()
 
 class SoriHamConfigView(discord.ui.View):
-    def __init__(self, title, owner_id, description):
+    def __init__(self, title, owner_id):
         super().__init__(timeout=300)
         self.title = title
         self.owner_id = owner_id
-        self.description = description
+        self.description = ""
         self.channel_id = None
         self.role_ids = []
         self.features = []
         self.add_item(_SoriHamChannelSelect(self))
         self.add_item(_SoriHamRoleSelect(self))
         self.add_item(_SoriHamFeatureSelect(self))
-        save_button = discord.ui.Button(label="소리함 저장 및 안내글 등록", style=discord.ButtonStyle.primary, row=3)
-        save_button.callback = self.save
-        self.add_item(save_button)
+        next_button = discord.ui.Button(label="다음: 안내 내용 작성", style=discord.ButtonStyle.secondary, row=3)
+        next_button.callback = self.open_description_modal
+        self.add_item(next_button)
 
     async def interaction_check(self, interaction):
         if interaction.user.id != self.owner_id:
@@ -2451,10 +2455,13 @@ class SoriHamConfigView(discord.ui.View):
             return False
         return True
 
-    async def save(self, interaction):
+    async def open_description_modal(self, interaction):
         if not self.channel_id or not self.features:
-            await interaction.response.send_message("안내글 채널과 활성화할 기능을 먼저 선택해 주세요.", ephemeral=True, delete_after=5)
+            await interaction.response.send_message("안내글 채널과 활성화할 티켓 종류를 먼저 선택해 주세요.", ephemeral=True, delete_after=5)
             return
+        await interaction.response.send_modal(SoriHamDescriptionModal(self))
+
+    async def save(self, interaction):
         guild = interaction.guild
         gs = get_gs(guild.id)
         channel = guild.get_channel(self.channel_id)
@@ -2477,29 +2484,47 @@ class SoriHamConfigView(discord.ui.View):
         msg = await channel.send(embed=embed, view=SoriHamPanelView(self.title))
         gs.update({"soriham_title": self.title, "soriham_description": self.description, "soriham_channel": channel.id, "soriham_panel_message": msg.id, "soriham_viewer_roles": self.role_ids, "soriham_features": self.features})
         save_settings(GUILD_SETTINGS)
-        await interaction.response.edit_message(content=f"✅ {self.title} 설정 완료: {channel.mention}\n활성화: {', '.join(self.features)}", view=None)
-        try:
-            await asyncio.sleep(5)
-            await interaction.delete_original_response()
-        except discord.HTTPException:
-            pass
+        self.stop()
+        await interaction.response.send_message(f"✅ {self.title} 설정 완료: {channel.mention}\n활성화: {', '.join(self.features)}", ephemeral=True, delete_after=5)
+
+class SoriHamDescriptionModal(discord.ui.Modal):
+    def __init__(self, config_view):
+        super().__init__(title="마지막 단계: 안내 내용 작성", timeout=180)
+        self.config_view = config_view
+        self.description_input = discord.ui.TextInput(
+            label="안내글 내용 (직접 작성)", style=discord.TextStyle.paragraph,
+            max_length=3000, required=True, placeholder="안내글에 표시할 내용을 직접 작성해 주세요."
+        )
+        self.add_item(self.description_input)
+
+    async def on_submit(self, interaction):
+        if interaction.user.id != self.config_view.owner_id:
+            await interaction.response.send_message("설정을 시작한 관리자만 진행할 수 있습니다.", ephemeral=True, delete_after=5)
+            return
+        description = self.description_input.value.strip()
+        if not description:
+            await interaction.response.send_message("안내 내용은 비워 둘 수 없습니다.", ephemeral=True, delete_after=5)
+            return
+        self.config_view.description = description
+        await self.config_view.save(interaction)
 
 class SoriHamTitleModal(discord.ui.Modal):
     def __init__(self, owner_id):
-        super().__init__(title="소리함 안내글 작성", timeout=180); self.owner_id=owner_id
-        self.title_input=discord.ui.TextInput(label="안내글 제목", default="소리함", max_length=60, required=True)
-        self.description_input=discord.ui.TextInput(label="안내글 내용 (직접 작성)", style=discord.TextStyle.paragraph, max_length=3000, required=True, placeholder="안내글에 표시할 내용을 직접 작성해 주세요.")
+        super().__init__(title="소리함 이름 설정", timeout=180)
+        self.owner_id = owner_id
+        self.title_input = discord.ui.TextInput(label="소리함 제목", default="소리함", max_length=60, required=True)
         self.add_item(self.title_input)
-        self.add_item(self.description_input)
+
     async def on_submit(self, interaction):
         if interaction.user.id != self.owner_id:
-            await interaction.response.send_message("설정을 시작한 관리자만 진행할 수 있습니다.", ephemeral=True, delete_after=5); return
+            await interaction.response.send_message("설정을 시작한 관리자만 진행할 수 있습니다.", ephemeral=True, delete_after=5)
+            return
         title = self.title_input.value.strip()
-        description = self.description_input.value.strip()
-        if not title or not description:
-            await interaction.response.send_message("안내글 제목과 내용은 비워 둘 수 없습니다.", ephemeral=True, delete_after=5); return
-        view=SoriHamConfigView(title, self.owner_id, description)
-        await interaction.response.send_message("안내 채널과 티켓에서 도움을 줄 역할, 사용할 티켓 종류를 선택한 뒤 저장해 주세요.", view=view, ephemeral=True)
+        if not title:
+            await interaction.response.send_message("소리함 제목은 비워 둘 수 없습니다.", ephemeral=True, delete_after=5)
+            return
+        view = SoriHamConfigView(title, self.owner_id)
+        await interaction.response.send_message("안내 채널, 티켓에서 도움을 줄 역할, 사용할 티켓 종류를 선택한 뒤 마지막 단계에서 안내 내용을 작성해 주세요.", view=view, ephemeral=True)
 
 # ====================================================================
 # 📚 기능 카탈로그 (카테고리 · 명령어 매핑)
@@ -2512,7 +2537,7 @@ CATEGORIES = {
     "역할": ("🎖️", "멤버 역할 지급"),
     "번역": ("🌐", "메시지 번역"),
     "청소": ("🧹", "채널 정리"),
-    "티켓": ("🎫", "사용자 지정 소리함의 문의·신고·상담"),
+    "티켓": ("🎫", "사용자 지정 소리함의 문의·신고·상담·기타"),
     "가이드": ("📖", "나또봇 사용 안내"),
 }
 
@@ -2606,8 +2631,8 @@ FEATURES = {
     # ---------- 통합 소리함 ----------
     "소리함": {
         "cat": "티켓", "label": "소리함 안내 채널", "store": "soriham_channel",
-        "desc": "사용자 지정 제목으로 문의·신고·상담 기능을 하나의 안내글에서 운영합니다.",
-        "usage": "`소리함 이름` → `안내 채널` → `티켓 열람 역할` → `문의·신고·상담 기능`",
+        "desc": "사용자 지정 제목으로 문의·신고·상담·기타 티켓을 하나의 안내글에서 운영합니다.",
+        "usage": "`소리함 이름` → `안내 채널` → `도움 역할` → `문의·신고·상담·기타` → `안내 내용`",
         "set": True, "check": True, "remove": True,
     },
     # ---------- 기타 ----------
@@ -2654,21 +2679,6 @@ def leaf_description(verb: str, field: str, f: dict) -> str:
         "체크": f"현재 {label} 설정을 확인합니다.",
         "초기화": f"등록된 {label}{josa(label, '을', '를')} 모두 초기화합니다. (✅/❌ 확인)",
     }[verb][:100]
-
-# 단계형 설정 화면에 붙이는 사용자 전용 취소 버튼입니다.
-def add_flow_cancel(view: discord.ui.View, owner_id: int):
-    cancel = discord.ui.Button(label="취소", emoji="✖️", style=discord.ButtonStyle.secondary, row=4)
-    async def _cancel(interaction: discord.Interaction):
-        if interaction.user.id != owner_id:
-            await interaction.response.send_message("❌ 이 명령어를 시작한 사용자만 취소할 수 있습니다.", ephemeral=True)
-            return
-        view.stop()
-        for item in view.children:
-            item.disabled = True
-        await interaction.response.edit_message(content="취소가 완료되었습니다.", embed=None, view=None)
-    cancel.callback = _cancel
-    view.add_item(cancel)
-    return view
 
 # ====================================================================
 # 🧩 활성화 시스템 (서버별 명령어 동적 등록)
@@ -2877,23 +2887,19 @@ async def generic_set_cb(interaction: discord.Interaction, 기능: str):
     elif 기능 in ("인증방", "경고로그", "입장", "퇴장"):
         view = discord.ui.View(timeout=180)
         view.add_item(SettingChannelSelect(기능))
-        add_flow_cancel(view, interaction.user.id)
         next_step = "채널을 선택하면 다음 단계에서 보낼 메시지를 입력합니다." if 기능 in ("입장", "퇴장") else "아래에서 채널을 선택하세요."
         await interaction.response.send_message(f"**{기능}** 설정: {next_step}", view=view, ephemeral=True)
     elif 기능 == "신고함":
         view = discord.ui.View(timeout=180)
         view.add_item(ReportChannelSelect())
-        add_flow_cancel(view, interaction.user.id)
         await interaction.response.send_message("**신고함** 설정: 안내글과 **신고함 열기** 버튼을 올릴 채널을 선택하세요.", view=view, ephemeral=True)
     elif 기능 == "문의함":
         view = discord.ui.View(timeout=180)
         view.add_item(InquiryChannelSelect())
-        add_flow_cancel(view, interaction.user.id)
         await interaction.response.send_message("**문의함** 설정 (1/2): 안내글과 **문의함 열기** 버튼을 올릴 채널을 선택하세요.", view=view, ephemeral=True)
     elif 기능 == "인증지급":
         view = discord.ui.View(timeout=180)
         view.add_item(SettingRoleSelect(기능))
-        add_flow_cancel(view, interaction.user.id)
         await interaction.response.send_message("**인증지급** 설정: 아래에서 지급할 역할을 선택하세요.", view=view, ephemeral=True)
     elif 기능 in ("인증메세지", "제재단어", "검열단어"):
         await interaction.response.send_modal(SettingTextModal(기능))
@@ -2927,7 +2933,7 @@ async def generic_check_cb(interaction: discord.Interaction, 기능: str):
             embed = _check_embed("소리함", f"제목: **{safe_text(gs.get('soriham_title','소리함'))}**\n안내 채널: {ch.mention}\n활성화 기능: {', '.join(gs.get('soriham_features', [])) or '없음'}", True)
             roles = [guild.get_role(rid) for rid in gs.get("soriham_viewer_roles", [])]
             roles = [r.mention for r in roles if r]
-            embed.add_field(name="티켓 내용을 볼 수 있는 역할", value=" ".join(roles) if roles else "별도 역할 없음 (서버 관리자만 열람)", inline=False)
+            embed.add_field(name="티켓에서 도움을 줄 사람", value=" ".join(roles) if roles else "별도 역할 없음 (서버 관리자만 열람)", inline=False)
         else:
             embed = _check_embed("소리함", "소리함이 설정되어 있지 않습니다.", False)
     elif 기능 in CHANNEL_SETTING_FEATURES:
@@ -2951,7 +2957,7 @@ async def generic_check_cb(interaction: discord.Interaction, 기능: str):
             if 기능 == "문의함":
                 viewers = [r for r in (guild.get_role(x) for x in gs.get("inquiry_roles", [])) if r]
                 embed.add_field(
-                    name="티켓 내용을 볼 수 있는 역할",
+                    name="티켓에서 도움을 줄 사람",
                     value=(" ".join(r.mention for r in viewers) if viewers else "지정된 역할 없음 (서버 관리자만 볼 수 있어요)"),
                     inline=False,
                 )
@@ -3260,12 +3266,12 @@ async def on_member_join(member: discord.Member):
         if channel and form:
             title = form
             embed = discord.Embed(title=title[:256], color=discord.Color.blurple(), timestamp=discord.utils.utcnow())
-            embed.add_field(name="들어온 유저", value=safe_text(member.display_name), inline=False)
+            embed.set_thumbnail(url=member.display_avatar.url)
+            embed.add_field(name="들어온 유저", value=member.mention, inline=False)
             embed.add_field(name="유저 ID", value=f"`{member.id}`", inline=True)
             embed.add_field(name="계정 생성 연도", value=f"{member.created_at.year}년", inline=True)
             try:
                 await channel.send(embed=embed)
-                await channel.send(member.mention, allowed_mentions=discord.AllowedMentions(users=True))
             except discord.HTTPException as exc:
                 print(f"인증 안내 메세지 전송 실패: {exc}")
 
